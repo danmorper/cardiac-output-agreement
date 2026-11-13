@@ -1,0 +1,1188 @@
+---
+title: "Monte Carlo studies"
+subtitle: "What breaks when the model is wrong?"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+execute:
+  warning: false
+bibliography: references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(lme4)  # linear mixed models with lmer(), used to check the closed form
+library(gt)    # nicely formatted tables, not part of the tidyverse
+
+source("../R/simulate_study.R")
+source("../R/fit_agreement.R")
+source("../R/fit_balanced.R")
+
+# An empty chunk with the same label as a "## ---- label ----" section of the
+# simulation script shows that part of the script (appendix E)
+knitr::read_chunk("../R/run_simulation.R")
+
+# Results of R/run_simulation.R, one row per simulated dataset
+study1 <- read_rds("../results/study1.rds")
+study2 <- read_rds("../results/study2.rds")
+
+n_sim <- n_distinct(study1$replicate)  # B
+n_boot <- unique(study1$n_boot)        # H
+z <- qnorm(0.975)
+
+# The scenarios of R/run_simulation.R, one row each
+scenarios_1 <- distinct(study1, block, scenario, icc, n_patients, n_per_patient,
+                        true_bias, sd_patient, sd_residual)
+scenarios_2 <- distinct(study2, scenario, sd_log_total, icc, n_patients, n_per_patient,
+                        true_bias, sd_patient, sd_residual)
+V <- mean(scenarios_1$sd_patient^2 + scenarios_1$sd_residual^2)  # 0.74 in every Study 1 scenario
+
+method_colors <- c("Classical" = "#D55E00", "Additive model" = "#009E73",
+                   "Multiplicative model" = "#0072B2")
+ci_method_colors <- c("Classical, observation bootstrap" = "#D55E00",
+                      "Classical, patient bootstrap" = "#E69F00",
+                      "Additive model, patient bootstrap" = "#009E73")
+percent <- function(x, digits = 1) sprintf(paste0("%.", digits, "f%%"), 100 * x)
+```
+
+Two simulation studies from chapter 6 of my thesis.
+Each asks what goes wrong when a Bland–Altman analysis ignores the true structure of the data.
+
+- **Study 1. Repeated measurements.** Measurements of the same patient are correlated. What if the analysis treats them as independent?
+- **Study 2. Multiplicative error.** The error grows with cardiac output (CO). What if the analysis assumes it is constant?
+
+Both studies follow the same approach.
+First derive from the model what should happen, then check it on `r format(n_sim, big.mark = ",")` simulated datasets per scenario.
+Three ideas explain every main result, and @fig-theory-vs-simulation shows that the formulas predict the simulation.
+All tables and technical details are in the appendix.
+
+```{r}
+#| label: measures
+#| code-summary: "Code: performance measures and predictions used in every figure"
+
+# ---- Study 1 ----
+
+# True limits of agreement of every scenario
+study1 <- study1 |>
+  mutate(sd_total = sqrt(sd_patient^2 + sd_residual^2),
+         true_lower_loa = true_bias - z * sd_total,
+         true_upper_loa = true_bias + z * sd_total)
+
+# Idea 1: predictions for the classical analysis in every scenario
+predictions_1 <- scenarios_1 |>
+  mutate(design_effect = 1 + (n_per_patient - 1) * icc,
+         s2_ratio = 1 - icc * (n_per_patient - 1) / (n_patients * n_per_patient - 1),  # E(s_D^2) / V
+         predicted_ratio = sqrt(s2_ratio / design_effect),
+         predicted_coverage = 2 * pnorm(z / sqrt(design_effect)) - 1)
+
+# 95% CI for the bias: SE ratio, coverage and width
+bias_ci <- study1 |>
+  select(block, scenario, icc, n_patients, n_per_patient, true_bias,
+         classical_bias, classical_se, additive_bias, additive_se) |>
+  pivot_longer(c(classical_bias, classical_se, additive_bias, additive_se),
+               names_to = c("method", ".value"), names_pattern = "(classical|additive)_(.*)") |>
+  mutate(
+    # Classical: IJ independent measurements. Additive model: I independent patients.
+    df = if_else(method == "classical", n_patients * n_per_patient - 1, n_patients - 1),
+    ci_lower = bias - qt(0.975, df) * se,
+    ci_upper = bias + qt(0.975, df) * se,
+    covered = ci_lower <= true_bias & true_bias <= ci_upper
+  ) |>
+  summarize(emp_se = sd(bias),
+            model_se = sqrt(mean(se^2)),
+            var_se2 = var(se^2),
+            coverage = mean(covered),
+            width = mean(ci_upper - ci_lower),
+            .by = c(block, scenario, icc, n_patients, n_per_patient, method)) |>
+  mutate(se_ratio = model_se / emp_se,
+         mcse_se_ratio = se_ratio * sqrt(var_se2 / (4 * n_sim * model_se^4) + 1 / (2 * (n_sim - 1))),
+         mcse_coverage = sqrt(coverage * (1 - coverage) / n_sim),
+         method = factor(method, levels = c("classical", "additive"),
+                         labels = c("Classical", "Additive model")))
+
+# Idea 2: SD of an estimated limit, the true one and the one the observation bootstrap sees
+sd_limit_true <- function(icc, n_patients, n_per_patient, V) {
+  I <- n_patients
+  J <- n_per_patient
+  var_patient <- icc * V
+  var_residual <- (1 - icc) * V
+  sqrt(V / (I * J) * (1 + (J - 1) * icc) +
+         z^2 * (I * (J - 1) * var_residual^2 + (I - 1) * (J * var_patient + var_residual)^2) / (2 * V * (I * J - 1)^2))
+}
+
+sd_limit_observation_bootstrap <- function(n_patients, n_per_patient, V) {
+  sqrt(V / (n_patients * n_per_patient) * (1 + z^2 / 2))
+}
+
+# Approximate coverage of the observation bootstrap CI of a limit
+observation_bootstrap_coverage <- function(icc, n_patients, n_per_patient, V) {
+  2 * pnorm(z * sd_limit_observation_bootstrap(n_patients, n_per_patient, V) /
+              sd_limit_true(icc, n_patients, n_per_patient, V)) - 1
+}
+
+# 95% bootstrap CIs for the limits: coverage and width
+loa_coverage <- study1 |>
+  select(block, scenario, icc, n_patients, n_per_patient, true_lower_loa, true_upper_loa,
+         ends_with(c("_ci_low", "_ci_high"))) |>
+  pivot_longer(ends_with(c("_ci_low", "_ci_high")),
+               names_to = c("method", "limit", ".value"),
+               names_pattern = "(.*)_(lower|upper)_loa_ci_(low|high)") |>
+  mutate(truth = if_else(limit == "lower", true_lower_loa, true_upper_loa),
+         covered = low <= truth & truth <= high) |>
+  summarize(coverage = mean(covered),
+            width = mean(high - low),
+            .by = c(block, scenario, icc, n_patients, n_per_patient, method, limit)) |>
+  mutate(mcse_coverage = sqrt(coverage * (1 - coverage) / n_sim),
+         method = factor(method, levels = c("classical_obs", "classical_patient", "additive_patient"),
+                         labels = names(ci_method_colors)))
+
+# ---- Study 2 ----
+
+# Idea 3: the constant limits the additive model converges to.
+# Reference CO of simulate_study(): log X = a_i + w_ij,
+# a_i ~ N(log 5, 0.25^2) for the patient, w_ij ~ N(0, 0.15^2) within the patient.
+sd_between <- 0.25
+sd_within <- 0.15
+mean_x <- 5 * exp((sd_between^2 + sd_within^2) / 2)    # E(X)
+mean_x2 <- 25 * exp(2 * (sd_between^2 + sd_within^2))  # E(X^2)
+mean_xx <- 25 * exp(2 * sd_between^2 + sd_within^2)    # E(X_ij X_ik), same patient
+
+theory_2 <- scenarios_2 |>
+  mutate(var_log = sd_log_total^2,
+         mean_q = exp(true_bias + var_log / 2),                  # E(Q)
+         mean_q2 = exp(2 * true_bias + 2 * var_log),             # E(Q^2)
+         mean_qq = exp(2 * true_bias + var_log + sd_patient^2),  # E(Q_ij Q_ik), same patient
+         mu_d = mean_x * (mean_q - 1),
+         v_d = mean_x2 * (mean_q2 - 2 * mean_q + 1) - mu_d^2,
+         c_d = mean_xx * (mean_qq - 2 * mean_q + 1) - mu_d^2,
+         lower_star = mu_d - z * sqrt(v_d),
+         upper_star = mu_d + z * sqrt(v_d),
+         # CO where each true line crosses the constant limit
+         x_lower = lower_star / (exp(true_bias - z * sd_log_total) - 1),
+         x_upper = upper_star / (exp(true_bias + z * sd_log_total) - 1))
+marked_theory <- filter(theory_2, sd_log_total == 0.20)
+
+# Share of future differences at reference CO x between lower and upper (both in L/min).
+# pmax(..., 0): D > -x always, so a lower limit at or below -x is never crossed (log(0) = -Inf).
+coverage_at_co <- function(lower, upper, x, log_bias, sd_log) {
+  pnorm((log(pmax(1 + upper / x, 0)) - log_bias) / sd_log) -
+    pnorm((log(pmax(1 + lower / x, 0)) - log_bias) / sd_log)
+}
+
+co_grid <- seq(2, 10, by = 0.25)
+study2 <- study2 |>
+  mutate(scenario = factor(paste0(scenario, ": SD of log(Y/X) = ", sd_log_total),
+                           levels = paste0(scenarios_2$scenario, ": SD of log(Y/X) = ", scenarios_2$sd_log_total)))
+
+# Estimated and true LoA in L/min at each reference CO.
+# The multiplicative limits are for log(Y/X): at CO = x they are x * (exp(limit) - 1).
+loa_by_co <- study2 |>
+  select(scenario, replicate, true_bias, sd_log_total,
+         additive_lower_loa, additive_upper_loa, multiplicative_lower_loa, multiplicative_upper_loa) |>
+  pivot_longer(c(additive_lower_loa, additive_upper_loa, multiplicative_lower_loa, multiplicative_upper_loa),
+               names_to = c("method", "limit"),
+               names_pattern = "(additive|multiplicative)_(lower|upper)_loa",
+               values_to = "estimate") |>
+  cross_join(tibble(co = co_grid)) |>
+  mutate(loa = if_else(method == "multiplicative", co * (exp(estimate) - 1), estimate),
+         true_log_loa = if_else(limit == "lower", true_bias - z * sd_log_total, true_bias + z * sd_log_total),
+         true_loa = co * (exp(true_log_loa) - 1),
+         method = factor(method, levels = c("additive", "multiplicative"),
+                         labels = c("Additive model", "Multiplicative model")))
+
+loa_band <- loa_by_co |>
+  summarize(mean = mean(loa), low = quantile(loa, 0.025), high = quantile(loa, 0.975),
+            .by = c(scenario, sd_log_total, method, limit, co))
+true_lines <- distinct(loa_by_co, scenario, sd_log_total, limit, co, true_loa)
+
+# Predictive coverage of the estimated limits in every simulated dataset
+predictive_2 <- loa_by_co |>
+  select(scenario, replicate, method, limit, co, loa, true_bias, sd_log_total) |>
+  pivot_wider(names_from = limit, values_from = loa) |>
+  mutate(coverage = coverage_at_co(lower, upper, co, true_bias, sd_log_total))
+
+predictive_band <- predictive_2 |>
+  summarize(mean = mean(coverage), low = quantile(coverage, 0.025), high = quantile(coverage, 0.975),
+            .by = c(scenario, sd_log_total, method, co))
+
+# Idea 3: coverage C*(x) of the constant limits L* and U*
+theory_curve <- theory_2 |>
+  cross_join(tibble(co = co_grid)) |>
+  mutate(coverage = coverage_at_co(lower_star, upper_star, co, true_bias, sd_log_total),
+         scenario = factor(paste0(scenario, ": SD of log(Y/X) = ", sd_log_total),
+                           levels = levels(study2$scenario)))
+
+# ---- Numbers quoted in the text ----
+coverage_of <- function(data, ...) filter(data, ...)$coverage
+strong <- filter(bias_ci, scenario == "Patient-dominated")
+strong_loa <- filter(loa_coverage, scenario == "Patient-dominated", limit == "lower")
+marked_coverage <- predictive_2 |>
+  filter(sd_log_total == 0.20, co %in% c(3, 8)) |>
+  summarize(coverage = mean(coverage), .by = c(method, co))
+```
+
+```{r}
+#| label: fig-theory-vs-simulation
+#| fig-cap: "Each point is one scenario, and for idea 3 one scenario at one reference CO from 2 to 10 L/min. Predicted: the formulas of ideas 1 to 3. Simulated: mean over the 1,000 datasets of the scenario. Dashed: predicted = simulated."
+#| fig-width: 8
+#| fig-height: 5.5
+theory_vs_simulation <- bind_rows(
+  # Idea 1: CI for the bias, every Study 1 scenario
+  bias_ci |>
+    left_join(select(predictions_1, scenario, predicted_coverage), by = "scenario") |>
+    transmute(idea = "Idea 1: CI for the bias",
+              method = as.character(method),
+              predicted = if_else(method == "Classical", predicted_coverage, 0.95),
+              simulated = coverage),
+  # Idea 2: observation bootstrap CI for the lower limit, every Study 1 scenario
+  loa_coverage |>
+    filter(method == "Classical, observation bootstrap", limit == "lower") |>
+    transmute(idea = "Idea 2: CI for the lower LoA",
+              method = "Classical",
+              predicted = observation_bootstrap_coverage(icc, n_patients, n_per_patient, V),
+              simulated = coverage),
+  # Idea 3: predictive coverage at each whole CO, both Study 2 scenarios
+  predictive_band |>
+    filter(co %in% 2:10) |>
+    left_join(select(theory_curve, scenario, co, additive_coverage = coverage), by = c("scenario", "co")) |>
+    transmute(idea = "Idea 3: predictive coverage at a given CO",
+              method = as.character(method),
+              predicted = if_else(method == "Additive model", additive_coverage, 0.95),
+              simulated = mean)
+)
+
+ggplot(theory_vs_simulation, aes(predicted, simulated, color = method, shape = idea)) +
+  geom_abline(linetype = "dashed") +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_color_manual(values = method_colors, name = NULL) +
+  scale_x_continuous(labels = scales::label_percent(), limits = c(0.5, 1)) +
+  scale_y_continuous(labels = scales::label_percent(), limits = c(0.5, 1)) +
+  coord_equal() +
+  labs(title = "The formulas predict the simulation",
+       x = "Predicted coverage", y = "Simulated coverage", shape = NULL) +
+  theme_minimal()
+```
+
+- **Ignoring the patient breaks the uncertainty, not the estimates.** Under strong clustering (ICC = 0.75, 40 patients × 8 measurements), the classical 95% CI for the bias covers the true bias in only `r percent(coverage_of(strong, method == "Classical"), 0)` of the datasets, the additive model in `r percent(coverage_of(strong, method == "Additive model"), 0)`. Both estimate the limits almost without bias.
+- **Resampling patients significantly improves the estimation of the uncertainty.** At the same ICC, resampling single measurements covers the lower limit in `r percent(coverage_of(strong_loa, method == "Classical, observation bootstrap"), 0)` of the datasets, resampling patients with the additive model in `r percent(coverage_of(strong_loa, method == "Additive model, patient bootstrap"), 0)`.
+- **With multiplicative error, constant limits are wrong at both ends.** The additive limits contain `r percent(coverage_of(marked_coverage, method == "Additive model", co == 3), 0)` of future differences at a CO of 3 L/min and `r percent(coverage_of(marked_coverage, method == "Additive model", co == 8), 0)` at 8 L/min. The multiplicative model contains `r percent(coverage_of(marked_coverage, method == "Multiplicative model", co == 8), 0)` at every CO.
+
+## Study 1: repeated measurements
+
+Each patient is measured $J$ times, and the differences follow the additive model $D_{ij} = \beta_0 + u_i + \varepsilon_{ij}$.
+The bias is $\beta_0 = 0.30$ L/min and the total variance is $V = \sigma_u^2 + \sigma_\varepsilon^2 = 0.74$, so the true LoA are `r sprintf("[%.2f, %.2f]", 0.30 - z * sqrt(V), 0.30 + z * sqrt(V))` L/min in every scenario.
+What changes is the ICC $\rho = \sigma_u^2/V$, the share of $V$ due to the patient: 0, 0.1, 0.338 and 0.75, with 40 patients × 8 measurements.
+The classical analysis treats all $IJ$ differences as independent. The additive model includes the patient effect $u_i$.
+
+::: {.callout-note collapse="true" icon="false" title="Why these scenarios"}
+Each comparison changes one thing only.
+
+- **$V$ is fixed.** Otherwise a higher ICC would also change the true limits, and a change in coverage could come from the limits, not from the clustering.
+- **ICC = 0 is a control.** There the classical analysis is the correct model, so it should do as well as the additive model.
+- **A second block keeps $IJ = 160$.** It splits 160 measurements as 20 × 8, 40 × 4 or 80 × 2, at ICC 0.338 and 0.75. The classical analysis sees the same number of measurements in all six designs, and only how they are split between patients changes ([appendix C](#sec-appendix-c)).
+:::
+
+### Idea 1: the design effect
+
+The $J$ measurements of a patient share the same $u_i$.
+Averaging them removes the residual error but not the patient effect, so they are worth less than $J$ independent measurements, and the mean difference varies more than the classical analysis assumes:
+
+$$
+\operatorname{Var}(\bar D) = \frac{\sigma_u^2}{I} + \frac{\sigma_\varepsilon^2}{IJ} = \frac{V}{IJ}\,\big[1 + (J-1)\rho\big].
+$$
+
+The classical analysis estimates this variance by $s_D^2/(IJ) \approx V/(IJ)$ and misses the **design effect** $1 + (J-1)\rho$.
+So its 95% CI for the bias covers only about $2\Phi\big(1.96/\sqrt{1 + (J-1)\rho}\big) - 1$ of the time, `r percent(2 * pnorm(z / sqrt(1 + 7 * 0.75)) - 1, 0)` at ICC = 0.75 with $J = 8$.
+The additive model uses the SD of the $I$ patient means instead, and its CI is exact at every ICC.
+
+::: {.callout-note collapse="true" icon="false" title="Derivation"}
+**The sums of squares.** Everything follows from the patient means $\bar D_i = \beta_0 + u_i + \bar\varepsilon_i$, where $\bar\varepsilon_i$ is the mean of the patient's $J$ residuals.
+They are independent and normal with variance $\sigma_u^2 + \sigma_\varepsilon^2/J$.
+The deviations within a patient, $D_{ij} - \bar D_i = \varepsilon_{ij} - \bar\varepsilon_i$, do not contain $u_i$.
+So the two sums of squares of the one-way analysis of variance are independent scaled $\chi^2$ variables, and both are independent of $\bar D$:
+
+$$
+SS_W = \sum_{i,j}(D_{ij} - \bar D_i)^2 \sim \sigma_\varepsilon^2\,\chi^2_{I(J-1)}, \qquad
+SS_B = J\sum_i(\bar D_i - \bar D)^2 \sim \left(J\sigma_u^2 + \sigma_\varepsilon^2\right)\chi^2_{I-1},
+$$
+
+with $J\sigma_u^2 + \sigma_\varepsilon^2 = V\,[1 + (J-1)\rho]$.
+
+**Variance of the mean.** $\bar D$ is the mean of the $I$ independent patient means, so $\operatorname{Var}(\bar D) = (\sigma_u^2 + \sigma_\varepsilon^2/J)/I$.
+With $\sigma_u^2 = \rho V$ and $\sigma_\varepsilon^2 = (1 - \rho)V$ this is $\frac{V}{IJ}\,[J\rho + 1 - \rho]$.
+
+**The classical SE.** The classical variance is $s_D^2 = (SS_W + SS_B)/(IJ - 1)$. With $E(c\,\chi^2_k) = ck$,
+
+$$
+E(s_D^2) = \frac{I(J-1)\,\sigma_\varepsilon^2 + (I-1)\left(J\sigma_u^2 + \sigma_\varepsilon^2\right)}{IJ-1} = V - \frac{(J-1)\,\sigma_u^2}{IJ-1}.
+$$
+
+So the mean squared SE that the classical analysis reports is $E(s_D^2)/(IJ)$, while the true variance is $\operatorname{Var}(\bar D)$.
+Their ratio gives the predicted SE ratio $\sqrt{E(s_D^2)\,/\,(V[1 + (J-1)\rho])}$ ([appendix C](#sec-appendix-c)).
+
+**The classical coverage.** Replace $s_D^2$ by its mean $\approx V$. Then the classical $t$ statistic is
+
+$$
+\frac{\bar D - \beta_0}{s_D/\sqrt{IJ}} \approx \sqrt{1 + (J-1)\rho}\;Z, \qquad Z \sim N(0, 1),
+$$
+
+which lies within $\pm 1.96$ with probability $2\Phi\big(1.96/\sqrt{1 + (J-1)\rho}\big) - 1$.
+This ignores the sampling variability of $s_D$, so it is an approximation.
+
+**The additive CI is exact.** Its SE is $s_{\bar D}/\sqrt I$, with $s_{\bar D}$ the SD of the $I$ patient means. So
+
+$$
+\frac{\bar D - \beta_0}{s_{\bar D}/\sqrt I} \sim t_{I-1}
+$$
+
+exactly, because it is the one-sample $t$ statistic of $I$ independent normal patient means.
+The squared SE is $s_{\bar D}^2/I = MS_B/(IJ)$ with $MS_B = SS_B/(I - 1)$, so $E(\widehat{SE}^2) = (J\sigma_u^2 + \sigma_\varepsilon^2)/(IJ) = \operatorname{Var}(\bar D)$, and the SE ratio is 1 up to Monte Carlo error.
+When REML is not at the boundary, this is also the model-based variance $\hat\sigma_u^2/I + \hat\sigma_\varepsilon^2/(IJ)$, because $\hat\sigma_u^2 = (MS_B - MS_W)/J$ and $\hat\sigma_\varepsilon^2 = MS_W$ add up to $MS_B/(IJ)$.
+
+**The estimates are fine.** By the formula for $E(s_D^2)$, the classical analysis underestimates $V$ only by the factor $1 - (J-1)\rho/(IJ-1)$, at most `r percent(0.75 * 7 / 319)` here (ICC = 0.75, 40 × 8).
+This moves each classical limit inward by only about `r sprintf("%.3f", z * sqrt(V) * (1 - sqrt(1 - 0.75 * 7 / 319)))` L/min, and the effect vanishes as the number of patients grows.
+The additive model estimates both variances without bias away from the boundary, because $E(MS_W) = \sigma_\varepsilon^2$ and $E(MS_B - MS_W)/J = \sigma_u^2$.
+:::
+
+```{r}
+#| label: fig-bias-coverage
+#| fig-cap: "Points: simulated coverage with ±1.96 Monte Carlo SE, 40 patients × 8 measurements. Line: idea 1 for the classical CI, 2Φ(1.96 / √(1 + 7 ICC)) − 1. Dashed: 95%, the exact coverage of the additive CI."
+#| fig-width: 7
+#| fig-height: 4.5
+# Idea 1. Classical CI half-width: 1.96 sqrt(V / IJ). True SE: sqrt(design effect * V / IJ).
+classical_theory <- tibble(icc = seq(0, 0.8, by = 0.01)) |>
+  mutate(coverage = 2 * pnorm(z / sqrt(1 + (8 - 1) * icc)) - 1)
+
+bias_ci |>
+  filter(block == "ICC") |>
+  ggplot(aes(icc, coverage, color = method)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  geom_line(data = classical_theory, aes(icc, coverage), inherit.aes = FALSE,
+            color = method_colors["Classical"], alpha = 0.5) +
+  geom_pointrange(aes(ymin = coverage - z * mcse_coverage, ymax = coverage + z * mcse_coverage)) +
+  scale_color_manual(values = method_colors, name = NULL) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(title = "Ignoring the patient makes the bias CI too narrow",
+       x = "ICC (share of the variance of D due to the patient)",
+       y = "Coverage of the 95% CI for the bias") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The same formula says how to spend a fixed number of measurements: fewer per patient means a smaller design effect.
+With 160 measurements at ICC = 0.75, the classical CI covers `r percent(coverage_of(bias_ci, scenario == "ICC 0.75: 20 patients x 8", method == "Classical"), 0)` of the time with 20 patients × 8 measurements and `r percent(coverage_of(bias_ci, scenario == "ICC 0.75: 80 patients x 2", method == "Classical"), 0)` with 80 × 2 ([appendix C](#sec-appendix-c)).
+The estimates themselves are fine. Both methods estimate the limits almost without bias, and their limits contain about 95% of future differences ([appendix C](#sec-appendix-c)).
+Ignoring the patient breaks the uncertainty, not the estimates.
+
+### Idea 2: resample the independent unit
+
+The CIs of the limits are percentile bootstrap intervals, in three versions.
+The classical limits either resample single measurements (observation bootstrap) or whole patients (patient bootstrap), and the additive limits resample patients.
+The two classical versions share the same estimate, so they differ only in what is resampled.
+
+The estimated lower limit is $\hat L = \bar D - 1.96\, s_D$.
+Its true variance grows with the ICC through both the mean and the SD:
+
+$$
+\operatorname{Var}(\hat L) \approx \frac{V}{IJ}\big[1 + (J-1)\rho\big]
++ 1.96^2\,\frac{I(J-1)\,\sigma_\varepsilon^4 + (I-1)\left(J\sigma_u^2 + \sigma_\varepsilon^2\right)^2}{2V\,(IJ-1)^2}.
+$$
+
+Resampling single measurements treats the $IJ$ differences as independent and sees only $\frac{V}{IJ}\big(1 + 1.96^2/2\big)$, the value at ICC = 0, whatever the ICC.
+So its intervals are too short, and more so as the ICC grows. They cover only about $2\Phi(1.96\, SD_{\text{boot}}/SD_{\text{true}}) - 1$ of the time, `r percent(observation_bootstrap_coverage(0.75, 40, 8, V), 0)` at ICC = 0.75 with 40 × 8.
+The patient bootstrap resamples the independent units, so it sees both terms.
+
+::: {.callout-note collapse="true" icon="false" title="Derivation"}
+**Two sources of variance.** $\bar D$ is independent of $SS_W$ and $SS_B$ (idea 1), so it is independent of $s_D$.
+By the delta method, $\operatorname{Var}(s_D) \approx \operatorname{Var}(s_D^2)/(4V)$, and $\operatorname{Var}(s_D^2) = \operatorname{Var}(SS_W + SS_B)/(IJ-1)^2$ with $\operatorname{Var}(c\,\chi^2_k) = 2c^2k$. So
+
+$$
+\operatorname{Var}(\hat L) \approx \underbrace{\frac{V}{IJ}\big[1 + (J-1)\rho\big]}_{\text{from } \bar D}
++ 1.96^2\,\underbrace{\frac{I(J-1)\,\sigma_\varepsilon^4 + (I-1)\left(J\sigma_u^2 + \sigma_\varepsilon^2\right)^2}{2V\,(IJ-1)^2}}_{\text{from } s_D}.
+$$
+
+The first term is the design effect of idea 1.
+In the second, with strong clustering $s_D^2$ is driven by $SS_B$, which has $I - 1$ degrees of freedom, not $IJ - 1$.
+
+**What the observation bootstrap sees.** The resampled mean has variance about $s_D^2/(IJ) \approx V/(IJ)$.
+Each $D_{ij}$ is marginally $N(\beta_0, V)$, so the pooled differences have a fourth central moment of about $3V^2$, and the resampled SD has variance about $(3V^2 - V^2)/(4V \cdot IJ) = V/(2IJ)$.
+The two are nearly uncorrelated because the distribution is symmetric.
+At ICC = 0 the two variances agree, so the predicted coverage is 95% there.
+
+**Coverage.** With $SD_{\text{true}}$ and $SD_{\text{boot}}$ the square roots of the two variances, the observation bootstrap CI is about $1.96\, SD_{\text{boot}}$ wide on each side of the estimate, while the estimate varies with SD $SD_{\text{true}}$. So it covers the true limit with probability about $2\Phi(1.96\, SD_{\text{boot}}/SD_{\text{true}}) - 1$.
+:::
+
+What a 95% CI promises is easiest to see one dataset at a time.
+Each horizontal line below is the CI from one simulated dataset, and the dot is that dataset's estimate of the lower limit.
+A 95% procedure should reach the true limit (dashed) in about 95 of every 100 datasets.
+
+```{r}
+#| label: fig-loa-intervals
+#| fig-cap: "95% CIs of the lower LoA in 100 randomly chosen simulated datasets (the same datasets in every panel), ordered by the estimate, 40 patients × 8 measurements. Dashed: true lower LoA. Black: the CI misses it. The coverage in each panel is over all 1,000 datasets."
+#| fig-width: 9
+#| fig-height: 9
+set.seed(3)
+shown <- sample(n_sim, 100)  # the same 100 datasets in every panel
+true_lower <- 0.30 - z * sqrt(V)
+
+intervals <- study1 |>
+  filter(block == "ICC", icc %in% c(0, 0.75), replicate %in% shown) |>
+  select(icc, replicate, classical_lower_loa, additive_lower_loa, matches("lower_loa_ci_(low|high)$")) |>
+  pivot_longer(matches("lower_loa_ci_(low|high)$"),
+               names_to = c("method", ".value"),
+               names_pattern = "(.*)_lower_loa_ci_(low|high)") |>
+  mutate(estimate = if_else(method == "additive_patient", additive_lower_loa, classical_lower_loa),
+         result = if_else(low <= true_lower & true_lower <= high, "Contains the true limit", "Misses it"),
+         method = factor(method, levels = c("classical_obs", "classical_patient", "additive_patient"),
+                         labels = names(ci_method_colors))) |>
+  mutate(rank = rank(estimate, ties.method = "first"), .by = c(icc, method))
+
+panel_labels <- loa_coverage |>
+  filter(block == "ICC", icc %in% c(0, 0.75), limit == "lower") |>
+  mutate(label = paste("Coverage:", percent(coverage)))
+
+ggplot(intervals, aes(y = rank)) +
+  geom_linerange(aes(xmin = low, xmax = high, color = result)) +
+  geom_point(aes(x = estimate, color = result), size = 0.7) +
+  geom_vline(xintercept = true_lower, linetype = "dashed") +
+  geom_text(data = panel_labels, aes(x = -Inf, y = Inf, label = label),
+            hjust = -0.1, vjust = 1.5, size = 3.2, inherit.aes = FALSE) +
+  facet_grid(method ~ icc, labeller = labeller(icc = as_labeller(\(x) paste("ICC =", x)),
+                                               method = label_wrap_gen(20))) +
+  scale_color_manual(values = c("Contains the true limit" = "grey70", "Misses it" = "black"), name = NULL) +
+  scale_y_continuous(expand = expansion(add = c(1, 12))) +
+  labs(title = "Resampling measurements gives intervals too short to reach the truth",
+       x = "Lower LoA (L/min): estimate and 95% CI", y = "100 simulated datasets, ordered by the estimate") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(), legend.position = "bottom")
+```
+
+At ICC = 0 the three procedures look alike and about 5 lines in 100 miss.
+At ICC = 0.75 the estimates spread much more, but the observation bootstrap intervals stay as short as at ICC = 0, so many miss.
+The width of the intervals shows it directly: a calibrated 95% CI needs a width of about $2 \times 1.96 \times SD_{\text{true}}$, which grows with the ICC.
+
+```{r}
+#| label: fig-loa-width
+#| fig-cap: "Each violin and box shows how wide the 95% CIs of the lower LoA were in the 1,000 simulated datasets (40 patients × 8 measurements). Black bar: the width a CI needs to contain the true limit in 95% of the datasets, 2 × 1.96 × the SD of the estimated limit between datasets. Dotted line: the width that idea 2 predicts for the observation bootstrap, the same at every ICC. A box below its black bar means intervals that are too short, so they miss the true limit more than 5% of the time. The upper LoA looks the same."
+#| fig-width: 9
+#| fig-height: 5
+widths <- study1 |>
+  filter(block == "ICC") |>
+  select(icc, replicate, matches("lower_loa_ci_(low|high)$")) |>
+  pivot_longer(matches("lower_loa_ci_(low|high)$"),
+               names_to = c("method", ".value"),
+               names_pattern = "(.*)_lower_loa_ci_(low|high)") |>
+  mutate(width = high - low,
+         method = factor(method, levels = c("classical_obs", "classical_patient", "additive_patient"),
+                         labels = names(ci_method_colors)))
+
+# Idea 2
+needed_width <- tibble(icc = unique(widths$icc)) |>
+  mutate(width = 2 * z * sd_limit_true(icc, n_patients = 40, n_per_patient = 8, V = V))
+observation_width <- 2 * z * sd_limit_observation_bootstrap(n_patients = 40, n_per_patient = 8, V = V)
+
+ggplot(widths, aes(factor(icc), width, fill = method)) +
+  geom_violin(position = position_dodge(width = 0.8), scale = "width", alpha = 0.3, color = NA) +
+  geom_boxplot(position = position_dodge(width = 0.8), width = 0.15, alpha = 0.7, outlier.shape = NA) +
+  geom_errorbar(data = needed_width, aes(factor(icc), ymin = width, ymax = width),
+                inherit.aes = FALSE, width = 0.9, linewidth = 0.8) +
+  geom_hline(yintercept = observation_width, linetype = "dotted") +
+  scale_fill_manual(values = ci_method_colors, name = NULL) +
+  labs(title = "The observation bootstrap does not widen its CIs as the ICC grows",
+       x = "ICC", y = "Width of the 95% CI of the lower LoA (L/min)") +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+As predicted, the observation bootstrap gives about `r sprintf("%.2f", observation_width)` L/min at every ICC, while a calibrated CI must grow to `r sprintf("%.2f", needed_width$width[needed_width$icc == 0.75])` L/min at ICC = 0.75.
+The patient bootstrap intervals grow with the ICC but stay a little short of the black bars, which is why their coverage is a few points below 95% ([appendix C](#sec-appendix-c)).
+
+## Study 2: multiplicative error
+
+Now the error is proportional to the CO: $\log(Y_{ij}/X_{ij}) = \beta_0 + u_i + \varepsilon_{ij}$, with a geometric mean ratio $e^{\beta_0} = 1.05$, a log-scale ICC of 0.338 and an SD $\sigma = 0.20$ of $\log(Y/X)$, for 40 patients × 8 measurements.
+The reference $X$ is log-normal around 5 L/min.
+Both models include the patient. The multiplicative model is fitted to $\log(Y/X)$, the additive model to $Y - X$ in L/min.
+[Appendix D](#sec-appendix-d) adds a milder scenario with $\sigma = 0.10$, which looks the same with smaller effects.
+
+### Idea 3: constant limits cannot follow an error that grows with CO
+
+With $Q = Y/X$, the difference is $D = X(Q - 1)$. So at a reference CO $x$ the true limits are two lines through the origin:
+
+$$
+L(x) = x\left(e^{\beta_0 - 1.96\sigma} - 1\right), \qquad U(x) = x\left(e^{\beta_0 + 1.96\sigma} - 1\right).
+$$
+
+The multiplicative model estimates these lines, so it has the same coverage at every CO.
+The additive model converges to one constant pair of limits $[L^*, U^*] = \mu_D \mp 1.96\sqrt{V_D}$, with $\mu_D$ and $V_D$ the mean and variance of $D$ over all CO.
+Each constant limit is right at one CO only: the upper at $x_U$ = `r sprintf("%.1f", marked_theory$x_upper)` L/min and the lower at $x_L$ = `r sprintf("%.1f", marked_theory$x_lower)` L/min.
+Below these CO the constant limits are too wide, above them too narrow, and the share of future differences between them falls from 1 to 0 as the CO grows:
+
+$$
+C^*(x) = \Phi\left(\frac{\log(1 + U^*/x) - \beta_0}{\sigma}\right) - \Phi\left(\frac{\log(1 + L^*/x) - \beta_0}{\sigma}\right).
+$$
+
+This error is a bias, not noise, so more patients do not fix it: the additive limits converge to $L^*$ and $U^*$, which match the true lines only at $x_U$ and $x_L$.
+The constant limits also depend on who was studied, not only on the device.
+If every reference CO were multiplied by $\lambda$, every difference would be too, so $L^*$, $U^*$, $x_U$ and $x_L$ would all scale by $\lambda$.
+The same device would get additive limits half as wide in a population with half the CO, again right only near that population's typical CO.
+
+::: {.callout-note collapse="true" icon="false" title="Derivation"}
+**The true limits.** Write $Q = Y/X$, so $\log Q \sim N(\beta_0, \sigma^2)$ with $\sigma^2 = \sigma_u^2 + \sigma_\varepsilon^2$. In the simulation, $Q$ is independent of $X$.
+Given $X = x$, the difference $d = x(Q - 1)$ is increasing in $Q$, so its 2.5% and 97.5% quantiles are $L(x)$ and $U(x)$.
+At CO $x$, the estimated lines of the multiplicative model are $x(\hat L_{\text{ratio}} - 1)$ and $x(\hat U_{\text{ratio}} - 1)$, and a future difference is $x(Q - 1)$. Dividing by $x > 0$, the difference is between the lines exactly when $Q$ is between $\hat L_{\text{ratio}}$ and $\hat U_{\text{ratio}}$. This does not depend on $x$, so the multiplicative model has the same coverage at every CO.
+These statements are conditional on $X = x$, so they do not depend on the distribution of $X$.
+
+**What the additive model converges to.** In a balanced design its estimates are
+
+$$
+\hat\beta_0 = \bar D, \qquad
+\hat\sigma_\varepsilon^2 = MS_W, \qquad
+\hat\sigma_u^2 = \frac{MS_B - MS_W}{J}, \qquad
+[\hat L, \hat U] = \hat\beta_0 \mp 1.96\sqrt{\hat\sigma_u^2 + \hat\sigma_\varepsilon^2}.
+$$
+
+The differences of one patient are exchangeable:
+
+$$
+E(D_{ij}) = \mu_D, \qquad
+\operatorname{Var}(D_{ij}) = V_D, \qquad
+\operatorname{Cov}(D_{ij}, D_{ik}) = c_D \quad (j \ne k).
+$$
+
+So, whatever their distribution,
+
+$$
+E(MS_W) = \frac{1}{J-1}\,E\sum_{j}\left(D_{ij} - \bar D_i\right)^2 = V_D - c_D, \qquad
+E(MS_B) = J \operatorname{Var}(\bar D_i) = V_D + (J - 1)\,c_D,
+$$
+
+and by the law of large numbers, as $I \to \infty$,
+
+$$
+\hat\beta_0 \xrightarrow{\;p\;} \mu_D, \qquad
+\hat\sigma_u^2 \xrightarrow{\;p\;} c_D, \qquad
+\hat\sigma_\varepsilon^2 \xrightarrow{\;p\;} V_D - c_D, \qquad
+[\hat L, \hat U] \xrightarrow{\;p\;} [L^*, U^*] = \mu_D \mp 1.96\sqrt{V_D}.
+$$
+
+Because $X$ and $Q$ are independent, each moment splits into a product:
+
+$$
+\mu_D = E(X)\,[E(Q) - 1], \qquad
+V_D = E(X^2)\,E[(Q - 1)^2] - \mu_D^2, \qquad
+c_D = E(X_{ij}X_{ik})\,E[(Q_{ij} - 1)(Q_{ik} - 1)] - \mu_D^2.
+$$
+
+All of them are log-normal moments, $E(e^W) = e^{m + s^2/2}$ for $W \sim N(m, s^2)$.
+In `simulate_study()` the reference CO is $\log X_{ij} = a_i + w_{ij}$, with the patient's level $a_i \sim N(\log 5, s_b^2)$ and a change within the patient $w_{ij} \sim N(0, s_w^2)$, $s_b = 0.25$ and $s_w = 0.15$. So
+
+- $E(Q) = e^{\beta_0 + \sigma^2/2}$, $E(Q^2) = e^{2\beta_0 + 2\sigma^2}$ and $E(Q_{ij}Q_{ik}) = e^{2\beta_0 + \sigma^2 + \sigma_u^2}$ for $j \ne k$, because $\log Q_{ij} + \log Q_{ik} = 2\beta_0 + 2u_i + \varepsilon_{ij} + \varepsilon_{ik}$ has variance $4\sigma_u^2 + 2\sigma_\varepsilon^2$.
+- $E(X) = 5\,e^{(s_b^2 + s_w^2)/2}$, $E(X^2) = 25\,e^{2(s_b^2 + s_w^2)}$ and $E(X_{ij}X_{ik}) = 25\,e^{2s_b^2 + s_w^2}$ for $j \ne k$.
+
+Two measurements of the same patient share $a_i$, so $E(X_{ij}X_{ik}) = E(X)^2 e^{s_b^2}$ is larger than $E(X)^2$.
+So part of the patient variance $c_D$ of the additive model only says that patients have different CO levels, not that the device behaves differently in them.
+With an independent $X$ for every measurement, as in my thesis, this part would vanish.
+[Appendix D](#sec-appendix-d) compares $\mu_D$, $c_D$, $V_D$, $L^*$ and $U^*$ with the simulation.
+
+**The limits depend on the study population.** Replace every reference CO $X$ by $\lambda X$, with $\lambda > 0$ and the same $Q$.
+Every difference $D = X(Q - 1)$ becomes $\lambda D$, so
+
+$$
+\mu_D \to \lambda\,\mu_D, \qquad V_D \to \lambda^2 V_D, \qquad c_D \to \lambda^2 c_D, \qquad [L^*, U^*] \to [\lambda L^*, \lambda U^*].
+$$
+
+The moment formulas above give the same result, because $X$ enters them only through $E(X)$, $E(X^2)$ and $E(X_{ij}X_{ik})$, which scale by $\lambda$, $\lambda^2$ and $\lambda^2$.
+In `simulate_study()` this is a population with median CO $5\lambda$ instead of 5 L/min.
+The true lines $L(x)$ and $U(x)$ do not change, because they depend only on $Q$.
+
+**Where each constant limit is right.** The true lower line crosses $L^*$ at $x_L = L^*/(e^{\beta_0 - 1.96\sigma} - 1)$, and the upper line crosses $U^*$ at $x_U = U^*/(e^{\beta_0 + 1.96\sigma} - 1)$.
+Below these CO the constant limits are too wide, above them too narrow.
+So the CIs of the additive limits can only cover the true limits near $x_L$ and $x_U$.
+$L^*$ and $U^*$ are limits as $I \to \infty$, so this error does not shrink with more patients: at every other CO the additive limits converge to the wrong value, and their CIs shrink around it.
+Since $x_L$ and $x_U$ are proportional to $L^*$ and $U^*$, they also scale by $\lambda$. Whatever the population, the constant limits are right only near its own typical CO.
+
+**Coverage at CO $x$.** A future difference at $X = x$ is between constant limits $L$ and $U$ if and only if $\log(1 + L/x) \le \log Q \le \log(1 + U/x)$, which gives the formula for $C(x)$.
+Its second term is 0 when $1 + L/x \le 0$, because $Y > 0$ means $D > -x$.
+For $L < 0 < U$, the upper bound decreases and the lower bound increases with $x$, so $C(x)$ decreases strictly, from 1 as $x \to 0$ to 0 as $x \to \infty$.
+With $L^*$ and $U^*$, $C^*(x)$ therefore reaches 95% at one CO only, between $x_U$ and $x_L$.
+In a population scaled by $\lambda$ the limits are $\lambda L^*$ and $\lambda U^*$, and since $C$ depends on them only through $L/x$ and $U/x$, the coverage becomes $C^*(x/\lambda)$: the same curve, stretched along the CO axis.
+:::
+
+::: {.callout-note collapse="true" icon="false" title="The same limits on a Bland–Altman plot against the mean"}
+The figures here plot the difference against the reference $X$. A Bland–Altman plot usually puts the pairwise mean $M = (X + Y)/2$ on the horizontal axis instead.
+With $Y = XQ$ the mean is $M = X(1 + Q)/2$, so $X = 2M/(1 + Q)$, and a ratio $q$ corresponds to the difference
+
+$$
+d(m, q) = \frac{2m(q - 1)}{q + 1} = 2m \tanh\left(\frac{\log q}{2}\right)
+$$
+
+at mean $m$. It is increasing in $q$, so with the ratio limits $L_{\text{ratio}} = e^{\beta_0 - 1.96\sigma}$ and $U_{\text{ratio}} = e^{\beta_0 + 1.96\sigma}$ the limits on the Bland–Altman plot are again two lines through the origin [@parner2025]:
+
+$$
+L(m) = \frac{2m\left(L_{\text{ratio}} - 1\right)}{L_{\text{ratio}} + 1} = 2m\tanh\left(\frac{\beta_0 - 1.96\sigma}{2}\right), \qquad
+U(m) = \frac{2m\left(U_{\text{ratio}} - 1\right)}{U_{\text{ratio}} + 1} = 2m\tanh\left(\frac{\beta_0 + 1.96\sigma}{2}\right).
+$$
+
+A pair lies between the two lines exactly when its ratio $Q$ lies between the ratio limits, so the band contains 95% of all pairs.
+Unlike $L(x)$ and $U(x)$, these are not limits for a fixed mean $m$, because $M$ itself depends on $Q$.
+
+**Their width.** I found no published derivation of the width, so I derived it in my thesis:
+
+$$
+W(m) = U(m) - L(m) = \frac{4m\left(U_{\text{ratio}} - L_{\text{ratio}}\right)}{\left(1 + U_{\text{ratio}}\right)\left(1 + L_{\text{ratio}}\right)}
+= \frac{4m\sinh(1.96\sigma)}{\cosh\beta_0 + \cosh(1.96\sigma)}.
+$$
+
+For the last step, write $a = (\beta_0 + 1.96\sigma)/2$ and $b = (\beta_0 - 1.96\sigma)/2$.
+Then $\tanh a - \tanh b = \sinh(a - b)/(\cosh a \cosh b)$ and $2\cosh a\cosh b = \cosh(a + b) + \cosh(a - b) = \cosh\beta_0 + \cosh(1.96\sigma)$.
+Without multiplicative bias, $\beta_0 = 0$, it reduces to $W(m) = 4m\tanh(0.98\sigma)$.
+Against the reference the width is $W(x) = x\left(U_{\text{ratio}} - L_{\text{ratio}}\right) = 2x\,e^{\beta_0}\sinh(1.96\sigma)$.
+Both widths grow linearly, in $m$ and in $x$.
+:::
+
+```{r}
+#| label: fig-loa-by-co
+#| fig-cap: "SD of log(Y/X) = 0.20. Lines: mean estimated limits of agreement over the simulated datasets. Bands: 2.5% to 97.5% of the datasets. Dashed: true limits. Points: the CO where each constant additive limit is right (idea 3)."
+#| fig-width: 7
+#| fig-height: 4.5
+crossings <- tibble(co = c(marked_theory$x_upper, marked_theory$x_lower),
+                    loa = c(marked_theory$upper_star, marked_theory$lower_star),
+                    label = c("x[U]", "x[L]"))
+
+ggplot(filter(loa_band, sd_log_total == 0.20),
+       aes(co, mean, color = method, fill = method, group = interaction(method, limit))) +
+  geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.15, color = NA) +
+  geom_line() +
+  geom_line(data = filter(true_lines, sd_log_total == 0.20), aes(co, true_loa, group = limit),
+            inherit.aes = FALSE, linetype = "dashed") +
+  geom_point(data = crossings, aes(co, loa), inherit.aes = FALSE, size = 2) +
+  geom_text(data = crossings, aes(co, loa, label = label), inherit.aes = FALSE,
+            parse = TRUE, vjust = -0.8) +
+  scale_color_manual(values = method_colors, name = NULL, aesthetics = c("color", "fill")) +
+  labs(title = "Constant limits cannot follow an error that grows with CO",
+       x = "Reference CO X (L/min)", y = "Limits of agreement for Y - X (L/min)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+#| label: fig-predictive-study2
+#| fig-cap: "SD of log(Y/X) = 0.20. Lines: mean predictive coverage over the simulated datasets. Bands: 2.5% to 97.5% of the datasets, not a confidence interval. Dotted: C*(x) from idea 3. Dashed: 95%."
+#| fig-width: 7
+#| fig-height: 4.5
+ggplot(filter(predictive_band, sd_log_total == 0.20), aes(co, mean, color = method, fill = method)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.15, color = NA) +
+  geom_line() +
+  geom_line(data = filter(theory_curve, sd_log_total == 0.20), aes(co, coverage),
+            inherit.aes = FALSE, color = "black", linetype = "dotted") +
+  scale_color_manual(values = method_colors, name = NULL, aesthetics = c("color", "fill")) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(title = "Additive limits: too wide at low CO, too narrow at high CO",
+       x = "Reference CO X (L/min)", y = "Predictive coverage") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The additive model follows $C^*(x)$ closely, slightly below it because its limits are estimated, and contains 95% of future differences only between $x_U$ and $x_L$.
+For the same reason, its CIs can only cover the true limits near $x_U$ and $x_L$ ([appendix D](#sec-appendix-d)).
+
+<!-- WEB: Do not put the appendix (sections A to E below) on the project page, only the main part above.
+Instead:
+1. Upload the full rendered monte-carlo.html (self-contained, embed-resources: true) to the site next to the project page, and link it from the end of the main part as "Full analysis with appendix".
+2. Point every mention of the appendix in the main part to that full version, or reword it as "in the full analysis". There are about 9, for example "([appendix C](#sec-appendix-c))", "[Appendix D](#sec-appendix-d)" and "All tables and technical details are in the appendix".
+3. Also link the GitHub repository with the code. It is NOT on GitHub yet (2026-11-09). When it is, ask Daniel for the link before publishing. Never guess the URL. Until then, leave the GitHub link out. -->
+
+## Appendix
+
+### A. Monte Carlo framework
+
+Each scenario has $B$ = `r format(n_sim, big.mark = ",")` simulated datasets.
+In dataset $b$, a method gives an estimate $\hat\theta_b$ of a true value $\theta$, for example the lower LoA. Some metrics also use its standard error $\widehat{SE}_b$ or its 95% CI $[c_b^-, c_b^+]$.
+
+::: {.callout-tip appearance="simple" icon="false" title="How to read the table"}
+Metric
+:   what we measure.
+
+Estimate
+:   how we compute it from the $B$ datasets.
+
+Monte Carlo SE
+:   how precise that estimate is.
+
+Interpretation
+:   the question the metric answers.
+:::
+
+| Metric | Estimate | Monte Carlo SE | Interpretation |
+|---|---|---| --- |
+| Bias | $\bar{\hat\theta} - \theta$, with $\bar{\hat\theta} = \frac1B\sum_b \hat\theta_b$ | $SE_{\text{emp}}/\sqrt B$ | Is the method right on average? |
+| Empirical SE | $SE_{\text{emp}} = \sqrt{\frac{1}{B-1}\sum_b (\hat\theta_b - \bar{\hat\theta})^2}$ | $SE_{\text{emp}}/\sqrt{2(B-1)}$ | How variable are the estimates between datasets? |
+| Model SE / empirical SE | $R = SE_{\text{mod}}/SE_{\text{emp}}$, with $SE_{\text{mod}} = \sqrt{\frac1B\sum_b \widehat{SE}_b^2}$ | $R\sqrt{\frac{\operatorname{Var}(\widehat{SE}_b^2)}{4B\,SE_{\text{mod}}^4} + \frac{1}{2(B-1)}}$ | Does the method report the right uncertainty? |
+| CI coverage | $\hat p = \frac1B\sum_b \mathbb 1\{c_b^- \le \theta \le c_b^+\}$ | $\sqrt{\hat p(1-\hat p)/B}$ | How often does the CI contain the true value? |
+| CI width | $\frac1B\sum_b (c_b^+ - c_b^-)$ | $SD(c_b^+ - c_b^-)/\sqrt B$ | How wide are the CIs? |
+| Predictive coverage | $\frac1B\sum_b p_b$, see below | $SD(p_b)/\sqrt B$ | How often do future differences fall between the estimated limits? |
+
+- $R < 1$ means that the reported SE is too small, so the CIs are too narrow.
+- Coverage and width go together: any interval reaches 95% if it is wide enough.
+- The Monte Carlo SE is the simulation error of each metric. It shrinks with $B$, not with the sample size of the study.
+
+With $B = 1{,}000$, a coverage near 95% has a Monte Carlo SE of $\sqrt{0.95 \cdot 0.05 / 1000} \approx 0.7 \%$.
+The CIs of the LoA are percentile intervals from $H$ = `r n_boot` bootstrap replicates within each dataset.
+A larger $H$ makes each interval less noisy, but it does not reduce the Monte Carlo SE, which depends on $B$.
+
+**Predictive coverage** is a different question.
+CI coverage asks whether the CI of a limit contains the true limit.
+Predictive coverage asks what share of future differences, from new patients, falls between the estimated limits $\hat L_b$ and $\hat U_b$.
+It is computed exactly from the true distribution of $D$, not by simulating new patients.
+
+### B. Fast fitting: closed-form REML
+
+`lmer()` needs about 12 ms per fit, far too slow for `r format(n_sim, big.mark = ",")` datasets times `r n_boot` bootstrap refits.
+But every design here is balanced, and then REML for the random-intercept model has a closed form.
+With patient means $\bar D_i$, grand mean $\bar D$, $MS_W = \frac{1}{I(J-1)}\sum_{i,j}(D_{ij} - \bar D_i)^2$ and $MS_B = \frac{J}{I-1}\sum_i (\bar D_i - \bar D)^2$,
+
+$$
+\hat\beta_0 = \bar D, \qquad
+\hat\sigma_\varepsilon^2 = MS_W, \qquad
+\hat\sigma_u^2 = \frac{MS_B - MS_W}{J}, \qquad
+\widehat{SE}(\hat\beta_0) = \sqrt{\frac{MS_B}{IJ}} = \frac{s_{\bar D}}{\sqrt I}.
+$$
+
+If $MS_B < MS_W$, this $\hat\sigma_u^2$ would be negative.
+REML then puts it on the boundary, $\hat\sigma_u^2 = 0$, and re-estimates $\hat\sigma_\varepsilon^2 = SS_T/(IJ - 1)$ from all differences.
+For the bootstrap, the mean and the within-patient sum of squares of each patient are computed once, so each bootstrap replicate only resamples $I$ pairs of numbers (`R/fit_balanced.R`).
+
+The table compares the closed form with `fit_agreement()`, which uses `lmer()`, on three datasets.
+The last one has no patient effect and hits the boundary.
+
+```{r}
+#| label: closed-form-check
+#| message: false
+# Additive model fitted to the same data with the closed form and with lmer()
+compare_fits <- function(icc, seed, dataset) {
+  data <- simulate_study(scale = "additive", sd_patient = sqrt(icc * V),
+                         sd_residual = sqrt((1 - icc) * V), seed = seed)
+  n_patients <- n_distinct(data$patient)
+  t_crit <- qt(0.975, df = n_patients - 1)
+
+  d <- matrix(data$difference, nrow = n_patients, byrow = TRUE)
+  closed_form <- fit_balanced(d) |>
+    mutate(bias_lower = bias - t_crit * se,
+           bias_upper = bias + t_crit * se)
+  with_lmer <- fit_agreement(data, response = "difference")
+
+  quantities <- c(bias = "Bias", bias_lower = "Bias CI, lower end", bias_upper = "Bias CI, upper end",
+                  sd_patient = "SD between patients", sd_residual = "SD within patient",
+                  lower_loa = "Lower LoA", upper_loa = "Upper LoA")
+  tibble(dataset = dataset,
+         quantity = unname(quantities),
+         closed_form = unname(unlist(closed_form[names(quantities)])),
+         lmer = unname(unlist(with_lmer[names(quantities)])))
+}
+
+validation <- bind_rows(
+  compare_fits(icc = 0.750, seed = 1, dataset = "ICC 0.75"),
+  compare_fits(icc = 0.338, seed = 1, dataset = "ICC 0.338"),
+  compare_fits(icc = 0, seed = 1, dataset = "ICC 0 (boundary: sigma_u = 0)")
+) |>
+  mutate(difference = abs(closed_form - lmer))
+
+validation |>
+  gt(groupname_col = "dataset") |>
+  fmt_number(columns = c(closed_form, lmer), decimals = 4) |>
+  fmt_scientific(columns = difference, decimals = 1) |>
+  tab_header(title = "Closed form vs lmer()", subtitle = "40 patients x 8 measurements") |>
+  cols_label(quantity = "", closed_form = "Closed form", lmer = "lmer()", difference = "Difference")
+```
+
+All estimates agree up to the tolerance of the `lmer()` optimizer.
+The only difference is the bias CI at the boundary.
+There `lmer()` computes the SE from the re-estimated $\hat\sigma_\varepsilon^2$, while the closed form keeps the SD of the patient means, as in the thesis.
+With it, the $t$ interval is exact in every dataset, because the $I$ patient means are independent and normal.
+At ICC = 0, `r percent(mean(study1$additive_boundary[study1$icc == 0]), 0)` of the simulated datasets hit the boundary.
+
+### C. Study 1 in full {#sec-appendix-c}
+
+**The two analyses.** In a balanced design both use the mean of all differences as the bias.
+They differ in the SE of the bias and in the SD used for the limits.
+
+| | Classical | Additive model |
+|---|---|---|
+| SD for the LoA | $s_D$, SD of all $IJ$ differences | $\sqrt{\hat\sigma_u^2 + \hat\sigma_\varepsilon^2}$ (REML) |
+| SE of the bias | $s_D/\sqrt{IJ}$ | $s_{\bar D}/\sqrt I$, with $s_{\bar D}$ the SD of the $I$ patient means |
+| 95% CI for the bias | $\bar D \pm t_{0.975,\,IJ-1}\, SE$ | $\bar D \pm t_{0.975,\,I-1}\, SE$ |
+
+**Scenarios and predictions.** Idea 1 for the classical analysis in every scenario. For the additive model, idea 1 predicts an SE ratio of 1 and a coverage of 95% everywhere.
+
+```{r}
+#| label: study1-predictions
+predictions_1 |>
+  select(block, scenario, icc, n_patients, n_per_patient, design_effect, s2_ratio,
+         predicted_ratio, predicted_coverage) |>
+  gt(groupname_col = "block") |>
+  fmt_number(columns = icc, decimals = 3) |>
+  fmt_number(columns = c(design_effect, s2_ratio, predicted_ratio), decimals = 3) |>
+  fmt_percent(columns = predicted_coverage, decimals = 0) |>
+  tab_spanner(label = "Classical analysis, predicted", columns = c(s2_ratio, predicted_ratio, predicted_coverage)) |>
+  tab_header(title = "Study 1 scenarios and the predictions for the classical analysis",
+             subtitle = "ICC block: 40 x 8 = 320 measurements. Allocation block: 160 measurements.") |>
+  cols_label(scenario = "", icc = "ICC", n_patients = "Patients I",
+             n_per_patient = "Measurements per patient J", design_effect = "Design effect",
+             s2_ratio = html("E(s<sub>D</sub><sup>2</sup>) / V"), predicted_ratio = "SE ratio",
+             predicted_coverage = "Bias CI coverage")
+```
+
+**Allocation of 160 measurements.**
+
+```{r}
+#| label: fig-bias-coverage-allocation
+#| fig-cap: "The same 160 measurements split between patients in three ways. Points: simulated coverage with ±1.96 Monte Carlo SE. Crosses: idea 1 for the classical CI. Dashed: 95%, the exact coverage of the additive CI."
+#| fig-width: 8
+#| fig-height: 4.5
+allocation <- bias_ci |>
+  filter(block == "Allocation") |>
+  left_join(select(predictions_1, scenario, predicted_coverage), by = "scenario") |>
+  mutate(design = fct_reorder(paste(n_patients, "x", n_per_patient), n_per_patient),
+         icc = paste("ICC =", icc))
+
+ggplot(allocation, aes(design, coverage, color = method)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  geom_pointrange(aes(ymin = coverage - z * mcse_coverage, ymax = coverage + z * mcse_coverage)) +
+  geom_point(data = filter(allocation, method == "Classical"), aes(y = predicted_coverage),
+             shape = 4, size = 3, color = "black") +
+  facet_wrap(~ icc) +
+  scale_color_manual(values = method_colors, name = NULL) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(title = "More patients with fewer measurements each: the classical CI improves",
+       x = "Patients x measurements per patient", y = "Coverage of the 95% CI for the bias") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+**Point estimates.**
+
+```{r}
+#| label: study1-point
+study1 |>
+  filter(block == "ICC") |>
+  select(icc, true_lower_loa, true_upper_loa,
+         classical_lower_loa, classical_upper_loa, additive_lower_loa, additive_upper_loa) |>
+  pivot_longer(c(classical_lower_loa, classical_upper_loa, additive_lower_loa, additive_upper_loa),
+               names_to = c("method", "limit"), names_pattern = "(classical|additive)_(.*)",
+               values_to = "estimate") |>
+  mutate(truth = if_else(limit == "lower_loa", true_lower_loa, true_upper_loa)) |>
+  summarize(bias = mean(estimate - truth),
+            emp_se = sd(estimate),
+            .by = c(icc, method, limit)) |>
+  pivot_wider(names_from = limit, values_from = c(bias, emp_se)) |>
+  mutate(method = factor(method, levels = c("classical", "additive"),
+                         labels = c("Classical", "Additive model"))) |>
+  arrange(icc, method) |>
+  select(icc, method, bias_lower_loa, emp_se_lower_loa, bias_upper_loa, emp_se_upper_loa) |>
+  gt() |>
+  fmt_number(columns = -method, decimals = 3) |>
+  tab_spanner(label = "Lower LoA", columns = ends_with("lower_loa")) |>
+  tab_spanner(label = "Upper LoA", columns = ends_with("upper_loa")) |>
+  tab_header(title = "Both methods estimate the limits well",
+             subtitle = "Bias and empirical SE of the estimated LoA in L/min, 40 patients x 8 measurements") |>
+  tab_source_note("Bias = mean estimate - true value. Its Monte Carlo SE is the empirical SE / sqrt(B).") |>
+  cols_label(icc = "ICC", method = "", bias_lower_loa = "Bias", emp_se_lower_loa = "Empirical SE",
+             bias_upper_loa = "Bias", emp_se_upper_loa = "Empirical SE")
+```
+
+As idea 1 says, both methods estimate the limits almost without bias.
+The bias estimate is the same for both in a balanced design.
+The classical limits are slightly too narrow at high ICC, because $E(s_D^2) < V$, but the effect is small compared with the empirical SE.
+
+**Confidence interval for the bias.**
+
+```{r}
+#| label: study1-bias-table
+bias_ci |>
+  left_join(select(predictions_1, scenario, predicted_ratio, predicted_coverage), by = "scenario") |>
+  # Idea 1: the additive model has SE ratio 1 and coverage 95% in every scenario
+  mutate(predicted_ratio = if_else(method == "Classical", predicted_ratio, 1),
+         predicted_coverage = if_else(method == "Classical", predicted_coverage, 0.95)) |>
+  arrange(block != "ICC", icc, n_per_patient, method) |>
+  select(scenario, method, emp_se, model_se, predicted_ratio, se_ratio, predicted_coverage, coverage, width) |>
+  gt(groupname_col = "scenario") |>
+  fmt_number(columns = c(emp_se, model_se, predicted_ratio, se_ratio, width), decimals = 3) |>
+  fmt_percent(columns = c(predicted_coverage, coverage), decimals = 1) |>
+  tab_spanner(label = "SE ratio", columns = c(predicted_ratio, se_ratio)) |>
+  tab_spanner(label = "Coverage", columns = c(predicted_coverage, coverage)) |>
+  tab_header(title = "Bias CI: the classical SE ignores the design effect",
+             subtitle = "SE ratio = model SE / empirical SE. Predicted: idea 1. Width in L/min.") |>
+  tab_source_note(sprintf("Largest Monte Carlo SE: %.3f for the ratio, %.1f percentage points for the coverage.",
+                          max(bias_ci$mcse_se_ratio), 100 * max(bias_ci$mcse_coverage))) |>
+  cols_label(method = "", emp_se = "Empirical SE", model_se = "Model SE",
+             predicted_ratio = "Predicted", se_ratio = "Simulated",
+             predicted_coverage = "Predicted", coverage = "Simulated", width = "Width")
+```
+
+The simulated SE ratios match idea 1 within Monte Carlo error.
+So the classical CI misses more often as the ICC and the number of measurements per patient grow, while the additive model stays at 95% in every scenario.
+The classical coverage is within 3 points of its approximate prediction, which ignores the sampling variability of $s_D$.
+
+**Confidence intervals for the limits of agreement.**
+
+```{r}
+#| label: fig-loa-coverage
+#| fig-cap: "Coverage of the 95% bootstrap CIs of the limits of agreement, 40 patients × 8 measurements, with ±1.96 Monte Carlo SE. Dotted: idea 2 for the observation bootstrap. Dashed: 95%."
+#| fig-width: 8
+#| fig-height: 4.5
+observation_theory <- tibble(icc = seq(0, 0.8, by = 0.01)) |>
+  mutate(coverage = observation_bootstrap_coverage(icc, n_patients = 40, n_per_patient = 8, V = V))
+
+loa_coverage |>
+  filter(block == "ICC") |>
+  ggplot(aes(icc, coverage, color = method)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  geom_line(data = observation_theory, aes(icc, coverage), inherit.aes = FALSE,
+            color = "grey30", linetype = "dotted") +
+  geom_line(position = position_dodge(width = 0.04), alpha = 0.5) +
+  geom_pointrange(aes(ymin = coverage - z * mcse_coverage, ymax = coverage + z * mcse_coverage),
+                  position = position_dodge(width = 0.04)) +
+  facet_wrap(~ limit, labeller = as_labeller(c(lower = "Lower LoA", upper = "Upper LoA"))) +
+  scale_color_manual(values = ci_method_colors, name = NULL) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(title = "Resampling patients, not measurements, fixes the LoA CIs",
+       x = "ICC", y = "Coverage of the 95% CI") +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+```{r}
+#| label: study1-loa-table
+loa_coverage |>
+  arrange(block != "ICC", icc, n_per_patient, method) |>
+  select(scenario, method, limit, coverage, width) |>
+  pivot_wider(names_from = limit, values_from = c(coverage, width)) |>
+  select(scenario, method, coverage_lower, width_lower, coverage_upper, width_upper) |>
+  gt(groupname_col = "scenario") |>
+  fmt_percent(columns = starts_with("coverage"), decimals = 1) |>
+  fmt_number(columns = starts_with("width"), decimals = 2) |>
+  tab_spanner(label = "Lower LoA", columns = ends_with("lower")) |>
+  tab_spanner(label = "Upper LoA", columns = ends_with("upper")) |>
+  tab_header(title = "95% bootstrap CIs of the limits of agreement", subtitle = "Width in L/min") |>
+  cols_label(method = "", coverage_lower = "Coverage", width_lower = "Width",
+             coverage_upper = "Coverage", width_upper = "Width")
+```
+
+The observation bootstrap follows idea 2, 1 to 3 points below it, the same kind of shortfall that the percentile interval already has at ICC = 0.
+The resampling unit matters much more than the estimator: with a patient bootstrap, the classical and the additive limits have almost the same coverage.
+Still, both patient bootstrap intervals stay a few points below 95% at every ICC, and more so with fewer patients (compare 20, 40 and 80 patients in the table).
+The patients are the independent units, and with few of them the percentile bootstrap is too narrow.
+
+**Predictive coverage.** For a new patient, a future difference is $D \sim N(\beta_0, V)$, so the share of future differences between the estimated limits is
+
+$$
+p_b = \Phi\left(\frac{\hat U_b - \beta_0}{\sqrt V}\right) - \Phi\left(\frac{\hat L_b - \beta_0}{\sqrt V}\right).
+$$
+
+```{r}
+#| label: fig-predictive-study1
+#| fig-cap: "Distribution of the predictive coverage over the simulated datasets, 40 patients × 8 measurements. Diamond: mean. Dashed: 95%."
+#| fig-width: 7
+#| fig-height: 4.5
+# Share of N(mean, sd^2) between lower and upper
+predictive_coverage <- function(lower, upper, mean, sd) {
+  pnorm((upper - mean) / sd) - pnorm((lower - mean) / sd)
+}
+
+predictive_1 <- study1 |>
+  filter(block == "ICC") |>
+  mutate(Classical = predictive_coverage(classical_lower_loa, classical_upper_loa, true_bias, sd_total),
+         `Additive model` = predictive_coverage(additive_lower_loa, additive_upper_loa, true_bias, sd_total)) |>
+  pivot_longer(c(Classical, `Additive model`), names_to = "method", values_to = "coverage") |>
+  mutate(method = factor(method, levels = c("Classical", "Additive model")))
+
+ggplot(predictive_1, aes(factor(icc), coverage, fill = method)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  geom_boxplot(alpha = 0.5, outlier.size = 0.5) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2,
+               position = position_dodge(width = 0.75)) +
+  scale_fill_manual(values = method_colors, name = NULL) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(title = "The estimated limits still contain about 95% of future differences",
+       x = "ICC", y = "Predictive coverage") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+As idea 1 says, clustering hardly changes the limits themselves, only their uncertainty.
+The mean predictive coverage is slightly below 95% for both methods, because the limits are estimated. Near the true limits, coverage is a concave function of each limit, so random error in $\hat L$ and $\hat U$ loses more coverage than it gains.
+
+### D. Study 2 in full {#sec-appendix-d}
+
+The reference $X$ comes from `simulate_study()`, log-normal around 5 L/min, with about 98% of the values between 2.5 and 10 L/min.
+Both scenarios have a geometric mean ratio of 1.05 and a log-scale ICC of 0.338, for 40 patients with 8 measurements each. Only the total SD $\sigma$ of $\log(Y/X)$ changes.
+
+```{r}
+#| label: study2-scenario-table
+scenarios_2 |>
+  mutate(ratio_lower_loa = exp(true_bias - z * sd_log_total),
+         ratio_upper_loa = exp(true_bias + z * sd_log_total),
+         ratio_loa = sprintf("[%.3f, %.3f]", ratio_lower_loa, ratio_upper_loa)) |>
+  select(scenario, sd_log_total, sd_patient, sd_residual, ratio_loa) |>
+  gt() |>
+  fmt_number(columns = c(sd_log_total, sd_patient, sd_residual), decimals = 3) |>
+  tab_header(title = "Study 2 scenarios") |>
+  cols_label(scenario = "", sd_log_total = "SD of log(Y/X)", sd_patient = "Between patients",
+             sd_residual = "Within patient", ratio_loa = "True LoA for Y/X")
+```
+
+**Both scenarios.**
+
+```{r}
+#| label: fig-loa-by-co-both
+#| fig-cap: "Lines: mean estimated limits of agreement over the simulated datasets. Bands: 2.5% to 97.5% of the datasets. Dashed: true limits."
+#| fig-width: 9
+#| fig-height: 4.5
+ggplot(loa_band, aes(co, mean, color = method, fill = method, group = interaction(method, limit))) +
+  geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.15, color = NA) +
+  geom_line() +
+  geom_line(data = true_lines, aes(co, true_loa, group = limit), inherit.aes = FALSE,
+            linetype = "dashed") +
+  facet_wrap(~ scenario) +
+  scale_color_manual(values = method_colors, name = NULL, aesthetics = c("color", "fill")) +
+  labs(title = "Constant limits cannot follow an error that grows with CO",
+       x = "Reference CO X (L/min)", y = "Limits of agreement for Y - X (L/min)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+#| label: fig-predictive-study2-both
+#| fig-cap: "Lines: mean predictive coverage over the simulated datasets. Bands: 2.5% to 97.5% of the datasets, not a confidence interval. Dotted: C*(x) from idea 3. Dashed: 95%."
+#| fig-width: 9
+#| fig-height: 4.5
+ggplot(predictive_band, aes(co, mean, color = method, fill = method)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.15, color = NA) +
+  geom_line() +
+  geom_line(data = theory_curve, aes(co, coverage), inherit.aes = FALSE,
+            color = "black", linetype = "dotted") +
+  facet_wrap(~ scenario) +
+  scale_color_manual(values = method_colors, name = NULL, aesthetics = c("color", "fill")) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(title = "Additive limits: too wide at low CO, too narrow at high CO",
+       x = "Reference CO X (L/min)", y = "Predictive coverage") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+**What the additive model converges to.**
+
+```{r}
+#| label: study2-theory-check
+# Idea 3: the limits of the additive model, predicted vs mean over the simulated datasets
+simulated_2 <- study2 |>
+  summarize(mu_d = mean(additive_bias),
+            c_d = mean(additive_sd_patient^2),
+            v_d = mean(additive_sd_patient^2 + additive_sd_residual^2),
+            lower_star = mean(additive_lower_loa),
+            upper_star = mean(additive_upper_loa),
+            .by = sd_log_total) |>
+  left_join(select(theory_2, scenario, sd_log_total), by = "sd_log_total")
+
+bind_rows(Predicted = select(theory_2, scenario, mu_d, c_d, v_d, lower_star, upper_star),
+          `Simulated mean` = select(simulated_2, scenario, mu_d, c_d, v_d, lower_star, upper_star),
+          .id = "source") |>
+  arrange(desc(scenario), source) |>
+  gt(groupname_col = "scenario") |>
+  fmt_number(columns = c(mu_d, c_d, v_d, lower_star, upper_star), decimals = 3) |>
+  tab_header(title = "The additive model converges to the predicted constant limits",
+             subtitle = "Idea 3. Bias and limits in L/min, variances in (L/min)².") |>
+  cols_label(source = "", mu_d = "Bias", c_d = "Variance between patients",
+             v_d = "Total variance", lower_star = "Lower LoA", upper_star = "Upper LoA")
+```
+
+**Confidence intervals for the limits of agreement.** The additive model has no single true value to compare its constant limits with, so its CIs are compared with the true limits at low, typical and high CO.
+
+```{r}
+#| label: study2-loa-ci
+study2 |>
+  select(scenario, replicate, true_bias, sd_log_total, ends_with(c("_ci_low", "_ci_high"))) |>
+  pivot_longer(ends_with(c("_ci_low", "_ci_high")),
+               names_to = c("method", "limit", ".value"),
+               names_pattern = "(additive|multiplicative)_(lower|upper)_loa_ci_(low|high)") |>
+  cross_join(tibble(co = c(3, 5, 8))) |>
+  mutate(
+    # CI in L/min at this CO. The multiplicative CI is for log(Y/X).
+    low = if_else(method == "multiplicative", co * (exp(low) - 1), low),
+    high = if_else(method == "multiplicative", co * (exp(high) - 1), high),
+    true_log_loa = if_else(limit == "lower", true_bias - z * sd_log_total, true_bias + z * sd_log_total),
+    truth = co * (exp(true_log_loa) - 1),
+    covered = low <= truth & truth <= high,
+    method = factor(method, levels = c("additive", "multiplicative"),
+                    labels = c("Additive model", "Multiplicative model"))
+  ) |>
+  summarize(coverage = mean(covered), .by = c(scenario, method, limit, co)) |>
+  pivot_wider(names_from = c(limit, co), values_from = coverage) |>
+  gt(groupname_col = "scenario") |>
+  fmt_percent(columns = -c(scenario, method), decimals = 1) |>
+  tab_spanner(label = "Lower LoA", columns = starts_with("lower")) |>
+  tab_spanner(label = "Upper LoA", columns = starts_with("upper")) |>
+  tab_header(title = "Coverage of the 95% CIs of the limits of agreement",
+             subtitle = "Against the true limits in L/min at a reference CO of 3, 5 and 8 L/min") |>
+  cols_label(method = "", lower_3 = "CO 3", lower_5 = "CO 5", lower_8 = "CO 8",
+             upper_3 = "CO 3", upper_5 = "CO 5", upper_8 = "CO 8")
+```
+
+The CIs of the multiplicative model have the same coverage at every CO, because $x(e^{t} - 1)$ is increasing in $t$. It is a little below 95%, for the same reason as the patient bootstrap in Study 1.
+As idea 3 says, the CIs of the additive model can only be right near the CO where its constant limits cross the true lines.
+At 5 L/min, close to $x_U$ = `r sprintf("%.1f and %.1f", theory_2$x_upper[1], theory_2$x_upper[2])` L/min (mild and marked), the upper limit is covered in most datasets.
+The lower limit crosses its true line at a higher CO, $x_L$ = `r sprintf("%.1f and %.1f", theory_2$x_lower[1], theory_2$x_lower[2])` L/min, so it is missed at all three CO in the table.
+
+**Predictive coverage.**
+
+```{r}
+#| label: study2-predictive-table
+predictive_band |>
+  filter(co %in% c(3, 5, 8)) |>
+  select(scenario, method, co, mean) |>
+  pivot_wider(names_from = co, names_prefix = "co_", values_from = mean) |>
+  gt(groupname_col = "scenario") |>
+  fmt_percent(columns = starts_with("co_"), decimals = 1) |>
+  tab_header(title = "Mean predictive coverage", subtitle = "At a reference CO of 3, 5 and 8 L/min") |>
+  cols_label(method = "", co_3 = "CO 3", co_5 = "CO 5", co_8 = "CO 8")
+```
+
+### E. Simulation code
+
+`R/run_simulation.R` simulates every dataset and saves one row per dataset in `results/`.
+These are its main parts.
+
+**Study 1 scenarios.**
+
+```{r}
+#| label: study1-scenarios
+#| eval: false
+```
+
+**Study 1: one simulated dataset and its analyses.**
+
+```{r}
+#| label: study1-analysis
+#| eval: false
+```
+
+**Study 2 scenarios.**
+
+```{r}
+#| label: study2-scenarios
+#| eval: false
+```
+
+**Study 2: one simulated dataset and its analyses.**
+
+```{r}
+#| label: study2-analysis
+#| eval: false
+```

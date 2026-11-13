@@ -1,0 +1,739 @@
+---
+title: "Joint agreement"
+subtitle: "Are the limits of agreement enough for repeated measurements?"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+execute:
+  warning: false
+bibliography: references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(lme4)  # linear mixed models with lmer(), used by fit_agreement()
+library(gt)    # nicely formatted tables, not part of the tidyverse
+
+source("../R/simulate_study.R")
+source("../R/fit_agreement.R")
+source("../R/fit_balanced.R")
+source("../R/joint_agreement.R")
+
+z <- qnorm(0.975)
+device_colors <- c("Device A" = "#56B4E9", "Device B" = "#E69F00")
+region_colors <- c("LoA x LoA square" = "#D55E00", "Calibrated square" = "#0072B2", "Ellipse" = "#009E73")
+criterion_labels <- c(coverage = "Clinical coverage, acceptable above 0.95",
+                      containment = "Containment ratio, acceptable below 1")
+thresholds <- tibble(criterion = factor(names(criterion_labels), levels = names(criterion_labels)),
+                     threshold = c(0.95, 1))
+```
+
+The limits of agreement (LoA) describe a **single** future measurement.
+A monitoring device, however, measures the same patient again and again, and the clinician reads these values together.
+Two simulated devices, A and B, show why this matters: they have the same LoA, but the repeated differences of one patient behave very differently.
+@fig-regions is the main result, and the sections below build it step by step.
+All tables and technical details are in the appendix.
+
+```{r}
+#| label: measures
+#| code-summary: "Code: data, fits and criteria used in every figure"
+#| cache: true
+#| cache.extra: !expr tools::md5sum(c("../R/simulate_study.R", "../R/fit_agreement.R", "../R/fit_balanced.R", "../R/joint_agreement.R"))
+#| message: false
+
+# ---- Data: two devices with the same bias and total variance ----
+total_variance <- 0.40
+
+# Same seed: both devices use the same random draws, only the split of the variance differs
+simulate_device <- function(icc) {
+  simulate_study(scale = "additive", bias = 0.2,
+                 sd_patient = sqrt(icc * total_variance),
+                 sd_residual = sqrt((1 - icc) * total_variance),
+                 seed = 1)
+}
+study_a <- simulate_device(icc = 0.7)  # Device A: patient-dominated
+study_b <- simulate_device(icc = 0.2)  # Device B: residual-dominated
+
+studies <- bind_rows(
+  study_a |> mutate(device = "Device A"),
+  study_b |> mutate(device = "Device B")
+)
+
+# One row per patient, one column per measurement (the data are sorted by patient)
+d_a <- matrix(study_a$difference, nrow = n_distinct(study_a$patient), byrow = TRUE)
+d_b <- matrix(study_b$difference, nrow = n_distinct(study_b$patient), byrow = TRUE)
+n_measurements <- ncol(d_a)  # every patient has 8 measurements, so the set of J is {8}
+
+# True parameters and LoA of each device
+truth <- bind_rows(
+  as_tibble(attr(study_a, "truth")) |> mutate(device = "Device A"),
+  as_tibble(attr(study_b, "truth")) |> mutate(device = "Device B")
+)
+
+# ---- 95% regions for two differences of a new patient, from the true parameters ----
+region_names <- names(region_colors)
+
+# Half-width and joint probability of each region
+regions <- truth |>
+  reframe(region = region_names,
+          half_width = c(z * sd_total, calibrated_half_width(sd_patient, sd_residual), NA),
+          probability = c(square_probability(half_width[1], sd_patient, sd_residual),
+                          square_probability(half_width[2], sd_patient, sd_residual),
+                          0.95),  # Mahalanobis distance ~ chi-square with 2 df
+          .by = c(device, bias)) |>
+  mutate(region = factor(region, levels = region_names))
+
+# ---- Additive model fitted to each device ----
+fit_a <- fit_agreement(study_a, response = "difference")
+fit_b <- fit_agreement(study_b, response = "difference")
+fits <- bind_rows(fit_a |> mutate(device = "Device A"),
+                  fit_b |> mutate(device = "Device B"))
+
+# ---- Clinical region: a device that would be just acceptable (thesis values, fixed before the study) ----
+clinical <- list(bias = 0, sd_patient = 0.65, sd_residual = 0.50)
+clinical_half_width <- z * sqrt(clinical$sd_patient^2 + clinical$sd_residual^2)
+
+# ---- Clinical coverage and containment ratio from the true parameters, J = 1 to 8 ----
+# pick(): the columns as a data frame, so pmap_dbl() calls the function once per row
+criteria_by_j <- expand_grid(select(truth, device, bias, sd_patient, sd_residual), J = 1:8) |>
+  mutate(coverage = pmap_dbl(pick(J, bias, sd_patient, sd_residual), clinical_coverage, clinical = clinical),
+         containment = pmap_dbl(pick(J, bias, sd_patient, sd_residual), containment_ratio, clinical = clinical))
+
+# ---- Exact binomial test, all 8 measurements of each patient ----
+binomial <- tibble(device = c("Device A", "Device B"),
+                   patients = c(nrow(d_a), nrow(d_b)),
+                   inside = c(sum(inside_clinical(d_a, clinical)), sum(inside_clinical(d_b, clinical)))) |>
+  mutate(p_value = map2_dbl(inside, patients,
+                            \(x, n) binom.test(x, n, p = 0.95, alternative = "greater")$p.value))
+
+# ---- Patient bootstrap of both criteria, J = 8 ----
+# Each replicate resamples whole patients and refits the model in closed form
+set.seed(2026)
+boot <- bind_rows(
+  bootstrap_patients(d_a, n_boot = 2000) |> mutate(device = "Device A"),
+  bootstrap_patients(d_b, n_boot = 2000) |> mutate(device = "Device B")
+) |>
+  select(device, bias, sd_patient, sd_residual) |>
+  mutate(coverage = pmap_dbl(pick(bias, sd_patient, sd_residual), clinical_coverage,
+                             J = n_measurements, clinical = clinical),
+         containment = containment_ratio(n_measurements, bias, sd_patient, sd_residual, clinical))
+
+# Estimates from the fitted model, one-sided 95% bootstrap bounds and true values
+estimates <- fits |>
+  mutate(coverage = pmap_dbl(pick(bias, sd_patient, sd_residual), clinical_coverage,
+                             J = n_measurements, clinical = clinical),
+         containment = containment_ratio(n_measurements, bias, sd_patient, sd_residual, clinical)) |>
+  select(device, coverage, containment)
+
+bounds <- boot |>
+  summarize(coverage_lower = quantile(coverage, 0.05),
+            containment_upper = quantile(containment, 0.95),
+            .by = device)
+
+true_values <- criteria_by_j |>
+  filter(J == n_measurements) |>
+  select(device, coverage_true = coverage, containment_true = containment)
+
+decisions <- estimates |>
+  left_join(bounds, by = "device") |>
+  left_join(true_values, by = "device") |>
+  mutate(coverage_shown = coverage_lower > 0.95,
+         containment_shown = containment_upper < 1)
+
+# ---- Numbers quoted in the text ----
+dec_a <- filter(decisions, device == "Device A")
+dec_b <- filter(decisions, device == "Device B")
+criterion_of <- function(device_name, j) filter(criteria_by_j, device == device_name, J == j)
+loa_square <- filter(regions, region == "LoA x LoA square")
+```
+
+```{r}
+#| label: fig-regions
+#| fig-cap: "95% regions for two differences of a new patient, from the true parameters of each device. LoA x LoA square: both differences inside the LoA. It contains more than 95% of the probability (d_1,d_2). Calibrated square: widened until it holds 95% of the pairs. Ellipse: the 95% prediction ellipse. Bar on top: the 95% limits of agreement of one difference, the same for both devices. Dotted: the diagonal, where the two differences are equal."
+#| fig-width: 9
+#| fig-height: 5.5
+squares <- filter(regions, region != "Ellipse")
+ellipses <- truth |>
+  reframe(ellipse_points(bias, sd_patient, sd_residual), .by = device) |>
+  mutate(region = factor("Ellipse", levels = region_names))
+
+# LoA of one difference, drawn as a bar above all regions to compare with them
+loa_bar <- truth |>
+  mutate(y = max(ellipses$d2, squares$bias + squares$half_width) + 0.3)
+
+ggplot() +
+  geom_rect(data = squares, aes(xmin = bias - half_width, xmax = bias + half_width,
+                                ymin = bias - half_width, ymax = bias + half_width,
+                                color = region, fill = region), alpha = 0.08) +
+  geom_polygon(data = ellipses, aes(d1, d2, color = region, fill = region), alpha = 0.08) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey40") +
+  geom_errorbar(data = loa_bar, aes(xmin = lower_loa, xmax = upper_loa, y = y),
+                width = 0.15, linewidth = 0.8) +
+  geom_text(data = loa_bar, aes(x = bias, y = y, label = "95% LoA"), vjust = -0.8, size = 3.5) +
+  scale_color_manual(values = region_colors, name = NULL, aesthetics = c("color", "fill")) +
+  facet_wrap(~ device) +
+  coord_equal() +
+  labs(title = "Same LoA square, different ellipses",
+       x = "First difference (L/min)", y = "Second difference (L/min)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+<!-- WEB: Interactive version of this plot for one device. Sliders for σ_u and σ_ε, bias fixed.
+Show the LoA × LoA square, the calibrated square and the ellipse, with their joint probability
+as text that updates. Add a toggle that keeps the total variance fixed and changes only
+the ICC: the LoA square then stays still while the ellipse goes from round (ICC 0) to thin (ICC near 1). -->
+
+- **Same LoA, different joint agreement.** Both devices have the same bias and total variance, so the same true LoA `r sprintf("[%.2f, %.2f]", truth$lower_loa[1], truth$upper_loa[1])` L/min, and for one measurement they are equally good. However, Device B has the lower ICC, the share of the variance that comes from persistent patient offsets (`r sprintf("%.1f", truth$icc[2])` vs `r sprintf("%.1f", truth$icc[1])`). The repeated differences of one patient are farther apart than for Device A (within-patient SD $\sigma_\varepsilon$ = `r sprintf("%.2f", truth$sd_residual[2])` vs `r sprintf("%.2f", truth$sd_residual[1])` L/min), while its patients differ less from each other (between-patient SD $\sigma_u$ = `r sprintf("%.2f", truth$sd_patient[2])` vs `r sprintf("%.2f", truth$sd_patient[1])` L/min).
+- **The ellipse shows the difference.** Two differences of the same patient have correlation equal to the ICC. Device A's 95% ellipse is long and thin along the diagonal: the two differences of a patient are similar, because each patient has a persistent offset. Device B's ellipse is almost round: the two differences often disagree, because most of the error is new at every measurement. The LoA cannot tell these two cases apart.
+- **The LoA square is not a 95% region.** Each difference alone is inside the LoA with probability 0.95, but both together only `r sprintf("%.1f%%", 100 * loa_square$probability[1])` for Device A and `r sprintf("%.1f%%", 100 * loa_square$probability[2])` for Device B. The ellipse holds exactly 95%.
+
+## Same limits, different patients
+
+The limits $\beta_0 \pm 1.96\sqrt{\sigma_u^2 + \sigma_\varepsilon^2}$ use only the total variance.
+They cannot tell a persistent offset of each patient ($\sigma_u$) from scatter between measurements of the same patient ($\sigma_\varepsilon$).
+
+To illustrate the problem, take one reference method $X$ and two hypothetical test devices, A and B, both used on the same 40 patients with 8 paired measurements per patient.
+Each device is compared with $X$ on its own, $Y_A - X$ for Device A and $Y_B - X$ for Device B, as in two separate validation studies.
+A and B are never compared with each other.
+
+The two devices are built to differ only in how their error splits between $\sigma_u^2$ and $\sigma_\varepsilon^2$:
+
+- **Same bias and total variance.** Both have bias $0.2$ L/min and $\sigma_u^2 + \sigma_\varepsilon^2 = 0.40\ (\text{L/min})^2$, so the same LoA.
+- **Device A, ICC 0.7.** Most of its error is a persistent offset of each patient, for example an algorithm that misjudges the physiology of a patient in the same way at every measurement.
+- **Device B, ICC 0.2.** Most of its error is new noise at every measurement.
+
+Both use the same random seed, so the patients, the reference values and the random draws are the same.
+Only the split of the variance differs.
+
+<!-- WEB: Plot the following figure and additionally another that should interactive. With slider ICC should change so change in ellipse should change too but LoA above should remain the same. This is to illustrate how LoA does not capture the information about how variance is split-->
+
+```{r}
+#| label: fig-same-loa
+#| fig-cap: "Each column is one patient, ordered by its median difference. Solid line: true bias. Dashed lines: true 95% limits of agreement, the same for both devices."
+#| fig-width: 9
+#| fig-height: 6
+studies |>
+  # Unique patient ids per device, ordered by their median difference
+  mutate(patient = fct_reorder(paste(device, patient), difference)) |>
+  ggplot(aes(patient, difference)) +
+  geom_point(alpha = 0.5, shape = 4) +
+  geom_hline(data = truth, aes(yintercept = bias)) +
+  geom_hline(data = truth, aes(yintercept = lower_loa), linetype = "dashed") +
+  geom_hline(data = truth, aes(yintercept = upper_loa), linetype = "dashed") +
+  facet_wrap(~ device, ncol = 1, scales = "free_x",
+             labeller = as_labeller(c("Device A" = "Device A: ICC 0.7", "Device B" = "Device B: ICC 0.2"))) +
+  labs(title = "Same limits of agreement, different patients",
+       subtitle = "Device A: each patient is consistently off. Device B: each patient scatters around the bias.",
+       x = "Patient", y = "Difference Y - X (L/min)") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), panel.grid.major.x = element_blank())
+```
+
+Each column holds the 8 differences of one patient. Look at how tall each column is and at what height it sits.
+
+- **Device A.** Short columns (small $\sigma_\varepsilon$) at very different heights (large $\sigma_u$). The patients on the left are underestimated at every measurement, those on the right overestimated.
+- **Device B.** Tall columns (large $\sigma_\varepsilon$): the 8 differences of one patient cover most of the band. All columns sit close to the bias (small $\sigma_u$).
+
+Pooled over all patients, which is what the LoA do, the two panels have the same distribution: in both, about 95% of all differences are expected between the dashed lines.
+
+Fitted separately, the additive model gives almost the same limits for both devices ([appendix A](#sec-appendix-a)).
+The limits cannot tell that with Device A one measurement predicts the next one from the same patient, and with Device B it does not.
+
+## The joint distribution is an ellipse
+
+Patient $i$ contributes the patient difference vector $\boldsymbol D_i = (D_{i1}, \ldots, D_{iJ})^\mathsf T$.
+Under the additive model $D_{ij} = \beta_0 + u_i + \varepsilon_{ij}$,
+
+$$
+\boldsymbol D_i = \beta_0 \boldsymbol 1_J + u_i \boldsymbol 1_J + \boldsymbol\varepsilon_i
+\sim N_J\left(\beta_0 \boldsymbol 1_J,\ \Sigma_J\right),
+\qquad
+\Sigma_J = \sigma_u^2\, \boldsymbol 1_J \boldsymbol 1_J^\mathsf T + \sigma_\varepsilon^2 I_J .
+$$
+
+Two differences of the same patient have correlation $\sigma_u^2/(\sigma_u^2 + \sigma_\varepsilon^2)$, the ICC.
+$\Sigma_J$ has only two eigenvalues:
+
+- $J\sigma_u^2 + \sigma_\varepsilon^2$ along $\boldsymbol 1_J/\sqrt J$: the patient effect moves all differences together.
+- $\sigma_\varepsilon^2$ in the $J - 1$ directions orthogonal to $\boldsymbol 1_J$: the residuals move the differences against each other.
+
+For $J = 2$ the picture is a sum of two parts.
+The patient part $(u_i, u_i)$ lies on the diagonal, the residual part $(\varepsilon_{i1}, \varepsilon_{i2})$ is circular, and their sum is an ellipse stretched along the diagonal.
+
+```{r}
+#| label: fig-ellipse-formation
+#| fig-cap: "Device A, centered at its bias. Color: density relative to the maximum of each panel. Squares: two points on the diagonal. Triangles: two points across it, at the same distance from the center. With residuals only, all four are equally likely. With the patient effect added, the points on the diagonal are much more likely."
+#| fig-width: 10
+#| fig-height: 4.5
+device_a <- filter(truth, device == "Device A")
+panels <- c("1. Patient effect", "2. Residuals", "3. Sum of both")
+grid <- expand_grid(d1 = seq(-1.8, 1.8, length.out = 181), d2 = seq(-1.8, 1.8, length.out = 181))
+
+densities <- bind_rows(
+  grid |> mutate(panel = panels[2],
+                 density = dnorm(d1, sd = device_a$sd_residual) * dnorm(d2, sd = device_a$sd_residual)),
+  grid |> mutate(panel = panels[3],
+                 density = exp(-mahalanobis(cbind(d1, d2), center = c(0, 0),
+                                            cov = joint_covariance(2, device_a$sd_patient, device_a$sd_residual)) / 2))
+) |>
+  mutate(density = density / max(density), .by = panel)
+
+# The patient effect alone has no 2-D density: all its probability is on the diagonal
+patient_line <- tibble(u = seq(-1.8, 1.8, length.out = 181)) |>
+  mutate(d1 = u, d2 = u, panel = panels[1],
+         density = dnorm(u, sd = device_a$sd_patient) / dnorm(0, sd = device_a$sd_patient))
+
+# Four points at the same distance from the center, two on the diagonal and two across it
+marked_points <- expand_grid(
+  panel = panels[2:3],
+  tibble(d1 = c(0.5, -0.5, 0.5, -0.5), d2 = c(0.5, -0.5, -0.5, 0.5),
+         position = rep(c("On the diagonal", "Across the diagonal"), each = 2))
+)
+
+ggplot(mapping = aes(d1, d2)) +
+  geom_raster(data = densities, aes(fill = density)) +
+  geom_contour(data = densities, aes(z = density), breaks = c(0.25, 0.5, 0.75),
+               color = "white", linewidth = 0.3) +
+  geom_path(data = patient_line, aes(color = density), linewidth = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey40") +
+  geom_point(data = marked_points, aes(shape = position), size = 2.5, fill = "white") +
+  scale_fill_gradient(low = "white", high = "#0072B2", guide = "none") +
+  scale_color_gradient(low = "grey95", high = "#0072B2", guide = "none") +
+  scale_shape_manual(values = c("On the diagonal" = 22, "Across the diagonal" = 24), name = NULL) +
+  facet_wrap(~ panel) +
+  coord_equal(expand = FALSE) +
+  labs(title = "The patient effect stretches the circle along the diagonal",
+       x = "First difference minus bias (L/min)", y = "Second difference minus bias (L/min)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The contours of this density are ellipses, and the one that holds 95% is the joint 95% prediction region
+
+$$
+E_J = \left\{\boldsymbol d :\ (\boldsymbol d - \beta_0 \boldsymbol 1_J)^\mathsf T \Sigma_J^{-1} (\boldsymbol d - \beta_0 \boldsymbol 1_J) \le \chi^2_{J,\,0.95}\right\}.
+$$
+
+For $J = 1$ it is the LoA interval.
+For $J = 2$ it competes with two simpler regions, both drawn in @fig-regions at the top:
+
+- **LoA x LoA square.** Both differences inside the LoA.
+- **Calibrated square.** The square widened until it holds 95% of the pairs.
+
+The LoA square is the same for both devices, but it holds only `r sprintf("%.1f%%", 100 * loa_square$probability[1])` of the pairs of Device A and `r sprintf("%.1f%%", 100 * loa_square$probability[2])` of Device B ([appendix B](#sec-appendix-b)).
+Each difference alone is inside with probability 0.95, and both together less often, the more so the weaker their correlation.
+The ellipse follows the correlation: thin across the diagonal for Device A, almost round for Device B.
+$E_J$ is a prediction region for the differences of a new patient, not a confidence region for the parameters.
+
+::: {.callout-note collapse="true" icon="false" title="Derivation"}
+**Eigenvalues.** $\Sigma_J \boldsymbol 1_J = \sigma_u^2 \boldsymbol 1_J (\boldsymbol 1_J^\mathsf T \boldsymbol 1_J) + \sigma_\varepsilon^2 \boldsymbol 1_J = (J\sigma_u^2 + \sigma_\varepsilon^2)\, \boldsymbol 1_J$.
+For $\boldsymbol v \perp \boldsymbol 1_J$, $\boldsymbol 1_J^\mathsf T \boldsymbol v = 0$, so $\Sigma_J \boldsymbol v = \sigma_\varepsilon^2 \boldsymbol v$.
+
+**The ellipse holds 95%.** $\boldsymbol Z = \Sigma_J^{-1/2}(\boldsymbol D_i - \beta_0 \boldsymbol 1_J) \sim N_J(\boldsymbol 0, I_J)$, so the squared Mahalanobis distance $\boldsymbol Z^\mathsf T \boldsymbol Z$ is a sum of $J$ independent squared standard normals, $\chi^2_J$.
+Hence $P(\boldsymbol D_i \in E_J) = 0.95$.
+For $J = 1$, $E_1 = \beta_0 \pm \sqrt{\chi^2_{1,\,0.95}}\,\sqrt{\sigma_u^2 + \sigma_\varepsilon^2}$ with $\sqrt{\chi^2_{1,\,0.95}} = z_{0.975} = 1.96$, the LoA.
+
+**The calibrated square.** Given $u_i$, the differences $D_{ij} - \beta_0 = u_i + \varepsilon_{ij}$ are independent $N(u_i, \sigma_\varepsilon^2)$, so
+
+$$
+P\big(\lvert D_{ij} - \beta_0 \rvert \le c \text{ for all } j \mid u_i\big) = \left[\Phi\left(\frac{c-u_i}{\sigma_\varepsilon}\right) - \Phi\left(\frac{-c-u_i}{\sigma_\varepsilon}\right)\right]^J ,
+$$
+
+and averaging over $u_i \sim N(0, \sigma_u^2)$, the half-width $c$ of the calibrated square solves
+
+$$
+\int \left[\Phi\left(\frac{c-u}{\sigma_\varepsilon}\right) - \Phi\left(\frac{-c-u}{\sigma_\varepsilon}\right)\right]^J \varphi(u;\, 0, \sigma_u^2)\, du = 0.95 .
+$$
+
+The solution lies between two known half-widths.
+The LoA half-width $1.96\sqrt{\sigma_u^2 + \sigma_\varepsilon^2}$ gives less than 95%, because all $J$ differences inside is less likely than one of them inside whenever $\sigma_\varepsilon > 0$.
+The Bonferroni half-width $z_{1 - 0.05/(2J)}\sqrt{\sigma_u^2 + \sigma_\varepsilon^2}$ gives at least 95%, because the probability that some difference is outside is at most $J \cdot 0.05/J$.
+`R/joint_agreement.R` solves the equation with `uniroot()` between these two.
+:::
+
+<!-- WEB: Add an interactive plot where ICC can be changed with a slider, the LoA is plotted on top of the ellipse and it never changes but the ellipse is updated. The goal is to show how the clinical region changes with different ICC values while the LoA remains fixed. -->
+
+## The clinical region
+
+We need to decide whether the estimated parameters are acceptable.
+To do so, we discuss with clinicians and fix, before the study, the **clinical parameters** $\boldsymbol\theta^* = (\beta_0^*, \sigma_u^*, \sigma_\varepsilon^*)$, those of a device that would be just acceptable. <!-- should I cite the part where I discuss this? -->
+They define the clinical region, the 95% ellipsoid of that device:
+
+$$
+A_{\mathrm{clin},J} = \left\{\boldsymbol d :\ (\boldsymbol d - \beta_0^* \boldsymbol 1_J)^\mathsf T {\Sigma_J^*}^{-1} (\boldsymbol d - \beta_0^* \boldsymbol 1_J) \le \chi^2_{J,\,0.95}\right\},
+\qquad
+\Sigma_J^* = {\sigma_u^*}^2\, \boldsymbol 1_J \boldsymbol 1_J^\mathsf T + {\sigma_\varepsilon^*}^2 I_J .
+$$
+
+Here $\beta_0^* = `r clinical$bias`$, $\sigma_u^* = `r sprintf("%.2f", clinical$sd_patient)`$ and $\sigma_\varepsilon^* = `r sprintf("%.2f", clinical$sd_residual)`$ L/min, the values used in the thesis.
+For one measurement, $A_{\mathrm{clin},1}$ is the interval $\pm`r sprintf("%.2f", clinical_half_width)`$ L/min.
+The true LoA of both devices, `r sprintf("[%.2f, %.2f]", truth$lower_loa[1], truth$upper_loa[1])` L/min, lie inside it, so a criterion based on the LoA alone cannot separate the devices.
+
+```{r}
+#| label: fig-clinical-ellipse
+#| fig-cap: "Measurements 1 and 2 of each patient. Solid: clinical ellipse. Dashed: fitted 95% ellipse of the device. Orange: outside the clinical ellipse."
+#| fig-width: 9
+#| fig-height: 5.5
+first_two <- studies |>
+  filter(measurement <= 2) |>
+  select(device, patient, measurement, difference) |>
+  pivot_wider(names_from = measurement, names_prefix = "d", values_from = difference) |>
+  mutate(inside = inside_clinical(cbind(d1, d2), clinical))
+
+ellipses_2 <- bind_rows(
+  fits |>
+    reframe(ellipse_points(bias, sd_patient, sd_residual), .by = device) |>
+    mutate(ellipse = "Fitted to the device"),
+  expand_grid(device = c("Device A", "Device B"),
+              ellipse_points(clinical$bias, clinical$sd_patient, clinical$sd_residual)) |>
+    mutate(ellipse = "Clinical")
+)
+
+ggplot(first_two, aes(d1, d2)) +
+  geom_path(data = ellipses_2, aes(linetype = ellipse)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey40") +
+  geom_point(aes(color = inside), shape = 4, size = 2) +
+  scale_color_manual(values = c("TRUE" = "grey30", "FALSE" = "#D55E00"), guide = "none") +
+  scale_linetype_manual(values = c("Clinical" = "solid", "Fitted to the device" = "dashed"), name = NULL) +
+  facet_wrap(~ device) +
+  coord_equal() +
+  labs(title = "Device B's ellipse sticks out across the diagonal",
+       x = "First difference (L/min)", y = "Second difference (L/min)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Device B's fitted ellipse sticks out of the clinical one across the diagonal, where the two differences of a patient disagree: its within-patient SD is larger than $\sigma_\varepsilon^*$.
+With two measurements this shows little, only `r sum(!first_two$inside[first_two$device == "Device B"])` of its 40 patients are outside.
+Each extra measurement adds another chance to disagree, and with all eight, `r binomial$patients[2] - binomial$inside[2]` of 40 are outside.
+
+## Counting patients is not enough
+
+Let $\pi_J = P(\boldsymbol D_i \in A_{\mathrm{clin},J})$ be the **clinical coverage**, the share of new patients with $J$ measurements whose difference vector falls in the clinical region.
+A device with exactly the clinical parameters has $\pi_J = 0.95$ for every $J$, so acceptable agreement means $\pi_J > 0.95$ for every number of measurements $J$ in the study.
+
+The simplest test counts the patients inside the clinical region and runs an exact one-sided binomial test of $\pi_J \le 0.95$.
+Even if every patient is inside, its p-value is $0.95^{I_J}$, with $I_J$ the number of patients with $J$ measurements, so it can reject only with at least 59 such patients.
+Here every patient has $J = 8$ and $I_8 = 40$.
+Device A has `r binomial$inside[1]` of `r binomial$patients[1]` patients inside, and still p = `r sprintf("%.2f", binomial$p_value[1])` ([appendix C](#sec-appendix-c)).
+In the clinical data of my thesis, patients had different numbers of measurements and no such group came close to 59.
+
+::: {.callout-note collapse="true" icon="false" title="Derivation"}
+**Hypotheses.** With $\mathcal J$ the set of numbers of measurements in the study,
+
+$$
+H_0:\ \pi_J \le 0.95 \text{ for some } J \in \mathcal J
+\qquad\text{vs}\qquad
+H_1:\ \pi_J > 0.95 \text{ for every } J \in \mathcal J .
+$$
+
+**Test for one $J$.** Let $C_i = 1$ if $\boldsymbol D_i \in A_{\mathrm{clin},J}$ and 0 otherwise.
+The patients are independent, so among the $I_J$ patients with $J$ measurements the number inside is $S_J = \sum_i C_i \sim \text{Binomial}(I_J, \pi_J)$.
+Large $S_J$ is evidence for $\pi_J > 0.95$, and the exact one-sided p-value is
+
+$$
+p_J = P(S_J \ge s_J \mid \pi_J = 0.95) = \sum_{k = s_J}^{I_J} \binom{I_J}{k}\, 0.95^k\, 0.05^{I_J - k} .
+$$
+
+$S_J$ is stochastically increasing in $\pi_J$, so for $\pi_J < 0.95$ the test rejects even less often, and it has level $\alpha$ on the whole null $\pi_J \le 0.95$.
+
+**Intersection–union.** $H_0$ is rejected only if every $p_J \le \alpha$.
+This needs no multiplicity correction: if $H_0$ is true, some $J_0$ has $\pi_{J_0} \le 0.95$, and rejecting $H_0$ requires rejecting the test for $J_0$, which happens with probability at most $\alpha$.
+
+**At least 59 patients.** The smallest p-value occurs when all patients are inside, $s_J = I_J$, and then $p_J = 0.95^{I_J}$.
+It is at most 0.05 if and only if $I_J \ge \log 0.05 / \log 0.95 = 58.4$, so $I_J \ge 59$.
+:::
+
+## Model-based criteria
+
+The binomial test only counts patients inside or outside.
+The model uses every difference: it estimates $\boldsymbol\theta = (\beta_0, \sigma_u, \sigma_\varepsilon)$ and computes two criteria from the fitted joint distribution, both shown for the true parameters in @fig-criteria-by-j.
+
+- **Clinical coverage $\pi_J$ (primary).** The same $\pi_J$ as above, computed from the model. $\Sigma_J$ and $\Sigma_J^*$ have the same eigenvectors, so $\pi_J$ reduces to a one-dimensional integral. Agreement is acceptable if $\pi_J > 0.95$ for every $J \in \mathcal J$, the same hypothesis as the binomial test.
+- **Containment ratio $R(J)$ (secondary).** The thesis compares the regions themselves: the device's 95% ellipsoid $E_J$ must lie inside $A_{\mathrm{clin},J}$, that is
+
+  $$
+  R(J) = \max_{\boldsymbol d \in E_J}
+  \frac{(\boldsymbol d - \beta_0^* \boldsymbol 1_J)^\mathsf T {\Sigma_J^*}^{-1} (\boldsymbol d - \beta_0^* \boldsymbol 1_J)}{\chi^2_{J,\,0.95}} \le 1,
+  \qquad
+  R_{\max} = \max_{J \in \mathcal J} R(J) .
+  $$
+
+  Containment implies $\pi_J \ge 0.95$, but not the other way round, so it is the stricter criterion. For $J = 1$ it is the classical criterion: the LoA inside the clinical interval.
+
+```{r}
+#| label: fig-criteria-by-j
+#| fig-cap: "Clinical coverage: the share of new patients whose J differences, taken together, fall in the clinical region. Containment ratio: how far the 95% prediction ellipsoid of the device reaches, relative to the clinical region. Both from the true parameters. Dashed: acceptance threshold. J = 1 is the question the LoA answer."
+#| fig-width: 9
+#| fig-height: 4
+criteria_by_j |>
+  pivot_longer(c(coverage, containment), names_to = "criterion", values_to = "value") |>
+  mutate(criterion = factor(criterion, levels = names(criterion_labels))) |>
+  ggplot(aes(J, value, color = device)) +
+  geom_hline(data = thresholds, aes(yintercept = threshold), linetype = "dashed") +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ criterion, scales = "free_y", labeller = as_labeller(criterion_labels)) +
+  scale_color_manual(values = device_colors, name = NULL) +
+  scale_x_continuous(breaks = 1:8) +
+  labs(title = "Identical for one measurement, apart for several",
+       x = "Measurements per patient J", y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+<!-- WEB: Interactive version: sliders for the device's bias, σ_u and σ_ε, clinical parameters fixed.
+Update this plot (π_J and R(J) against J) and, next to it, the J = 2 picture with the clinical
+ellipse and the device ellipse. It shows how a device can pass at J = 1 and fail from J = 2 on. -->
+
+Device B's containment ratio jumps above 1 at $J = 2$, because its within-patient SD is larger than $\sigma_\varepsilon^*$.
+Its coverage falls more slowly and drops below 0.95 from $J = `r min(filter(criteria_by_j, device == "Device B", coverage < 0.95)$J)`$ on: with one or two measurements per patient the extra scatter is hidden by chance, and every extra measurement shows it more clearly.
+
+::: {.callout-note collapse="true" icon="false" title="Derivation"}
+**Shared coordinates.** Let $\boldsymbol v_1 = \boldsymbol 1_J/\sqrt J$ and let the columns of $V$ be an orthonormal basis of the $J - 1$ directions orthogonal to $\boldsymbol 1_J$.
+For a point $\boldsymbol d$, write $a = \boldsymbol v_1^\mathsf T(\boldsymbol d - \beta_0^* \boldsymbol 1_J)$ and $\boldsymbol w = V^\mathsf T(\boldsymbol d - \beta_0^* \boldsymbol 1_J)$.
+In this basis $\Sigma_J$ is diagonal with entries $\lambda_J = J\sigma_u^2 + \sigma_\varepsilon^2$ and $\sigma_\varepsilon^2$ (derivation above), and $\Sigma_J^*$ with $\lambda_J^* = J{\sigma_u^*}^2 + {\sigma_\varepsilon^*}^2$ and ${\sigma_\varepsilon^*}^2$. So the clinical distance is
+
+$$
+(\boldsymbol d - \beta_0^* \boldsymbol 1_J)^\mathsf T {\Sigma_J^*}^{-1} (\boldsymbol d - \beta_0^* \boldsymbol 1_J) = \frac{a^2}{\lambda_J^*} + \frac{\lVert \boldsymbol w \rVert^2}{{\sigma_\varepsilon^*}^2} .
+$$
+
+For the device's $\boldsymbol D_i$, the vector $(a_i, \boldsymbol w_i)$ is normal with mean $(\delta, \boldsymbol 0)$, where $\delta = \sqrt J(\beta_0 - \beta_0^*)$ because $\boldsymbol v_1^\mathsf T \boldsymbol 1_J = \sqrt J$ and $V^\mathsf T \boldsymbol 1_J = \boldsymbol 0$, and with covariance $\operatorname{diag}(\lambda_J, \sigma_\varepsilon^2 I_{J-1})$.
+So $a_i \sim N(\delta, \lambda_J)$ and $\lVert \boldsymbol w_i \rVert^2/\sigma_\varepsilon^2 \sim \chi^2_{J-1}$, independently.
+
+**Clinical coverage.** With $c_J = \chi^2_{J,\,0.95}$, $\boldsymbol D_i \in A_{\mathrm{clin},J}$ if and only if $a_i^2/\lambda_J^* + \lVert \boldsymbol w_i \rVert^2/{\sigma_\varepsilon^*}^2 \le c_J$.
+Given $a_i = a$, this needs $\lvert a \rvert \le h = \sqrt{c_J \lambda_J^*}$ and $\lVert \boldsymbol w_i \rVert^2/\sigma_\varepsilon^2 \le ({\sigma_\varepsilon^*}^2/\sigma_\varepsilon^2)(c_J - a^2/\lambda_J^*)$. Averaging over $a_i$,
+
+$$
+\pi_J = \int_{-h}^{h} \varphi\left(a;\ \delta,\ \lambda_J\right)
+F_{\chi^2_{J-1}}\left(\frac{{\sigma_\varepsilon^*}^2}{\sigma_\varepsilon^2}\left(c_J - \frac{a^2}{\lambda_J^*}\right)\right) da .
+$$
+
+For $J = 1$ there is no $\boldsymbol w$, and $\pi_1 = \Phi\big((h - \delta)/\sqrt{\lambda_1}\big) - \Phi\big((-h - \delta)/\sqrt{\lambda_1}\big)$.
+
+**Containment ratio.** The clinical distance is a convex function of $\boldsymbol d$, and $E_J$ is compact and convex, so the maximum is on the boundary of $E_J$.
+A point of $E_J$ has $a = \delta + s$ with $s^2/\lambda_J + \lVert \boldsymbol w \rVert^2/\sigma_\varepsilon^2 \le c_J$.
+On the boundary $\lVert \boldsymbol w \rVert^2 = \sigma_\varepsilon^2(c_J - s^2/\lambda_J)$, so with $s = \sqrt{c_J \lambda_J}\, t$ for $t \in [-1, 1]$ the clinical distance is
+
+$$
+g(t) = \frac{\left(\sqrt{c_J \lambda_J}\, t + \delta\right)^2}{\lambda_J^*} + \frac{c_J\, \sigma_\varepsilon^2\,(1 - t^2)}{{\sigma_\varepsilon^*}^2} .
+$$
+
+It depends on the boundary point only through $t$, and it is a quadratic in $t$.
+So $R(J) = \max_{\lvert t \rvert \le 1} g(t)/c_J$ is reached at $t = -1$, at $t = 1$, or at the vertex of the parabola when it opens downward and its vertex lies in $[-1, 1]$.
+
+**$J = 1$ is the LoA criterion.** For $J = 1$ there is no $\boldsymbol w$, the boundary is $t = \pm 1$, and
+
+$$
+R(1) = \left(\frac{1.96\sqrt{\sigma_u^2 + \sigma_\varepsilon^2} + \lvert \beta_0 - \beta_0^* \rvert}{1.96\sqrt{{\sigma_u^*}^2 + {\sigma_\varepsilon^*}^2}}\right)^2 .
+$$
+
+So $R(1) \le 1$ if and only if both LoA lie inside the clinical interval $\beta_0^* \pm 1.96\sqrt{{\sigma_u^*}^2 + {\sigma_\varepsilon^*}^2}$.
+
+**Why Device B jumps at $J = 2$.** For $J \ge 2$, $t = 0$ gives $g(0) = \delta^2/\lambda_J^* + c_J\,\sigma_\varepsilon^2/{\sigma_\varepsilon^*}^2$, so $R(J) \ge (\sigma_\varepsilon/\sigma_\varepsilon^*)^2$.
+Containment for any $J \ge 2$ needs $\sigma_\varepsilon \le \sigma_\varepsilon^*$. Device B has $\sigma_\varepsilon = `r sprintf("%.3f", truth$sd_residual[2])` > `r sprintf("%.2f", clinical$sd_residual)`$.
+
+**Containment implies coverage.** If $E_J \subseteq A_{\mathrm{clin},J}$, then $\pi_J = P(\boldsymbol D_i \in A_{\mathrm{clin},J}) \ge P(\boldsymbol D_i \in E_J) = 0.95$.
+The converse fails: the coverage can be above 0.95 while a thin part of $E_J$ sticks out of $A_{\mathrm{clin},J}$.
+Device B at $J = 2$ has $\pi_2 = `r sprintf("%.3f", criterion_of("Device B", 2)$coverage)`$ but $R(2) = `r sprintf("%.2f", criterion_of("Device B", 2)$containment)`$.
+:::
+
+### Uncertainty: patient bootstrap
+
+$\boldsymbol\theta$ is estimated from 40 patients, so $\hat\pi_J$ and $\hat R(J)$ are uncertain.
+The 40 patients are resampled with replacement 2,000 times, the model is refitted (closed-form REML, as in the Monte Carlo document), and both criteria are recomputed.
+One-sided 95% percentile bounds give the decision rules, here with $\mathcal J = \{8\}$, so $R_{\max} = R(8)$:
+
+- **Primary.** Acceptable if the 5% quantile of the bootstrap $\hat\pi_J$ is above 0.95 for every $J \in \mathcal J$.
+- **Secondary.** Acceptable if the 95% quantile of the bootstrap $\hat R_{\max}$ is below 1.
+
+If a bound misses, acceptable agreement has not been shown. That is not evidence that the device is unacceptable.
+
+```{r}
+#| label: fig-bootstrap
+#| fig-cap: "Bootstrap distribution of the criteria for J = 8, 2,000 replicates. Dashed: acceptance threshold. Solid: one-sided 95% bound."
+#| fig-width: 9
+#| fig-height: 5
+boot_long <- boot |>
+  pivot_longer(c(coverage, containment), names_to = "criterion", values_to = "value") |>
+  mutate(criterion = factor(criterion, levels = names(criterion_labels)))
+
+bound_lines <- decisions |>
+  select(device, coverage = coverage_lower, containment = containment_upper) |>
+  pivot_longer(-device, names_to = "criterion", values_to = "bound") |>
+  mutate(criterion = factor(criterion, levels = names(criterion_labels)))
+
+ggplot(boot_long, aes(value, fill = device)) +
+  geom_histogram(bins = 40, alpha = 0.7) +
+  geom_vline(data = thresholds, aes(xintercept = threshold), linetype = "dashed") +
+  geom_vline(data = bound_lines, aes(xintercept = bound, color = device)) +
+  facet_wrap(vars(device, criterion), scales = "free", labeller = labeller(criterion = criterion_labels)) +
+  scale_fill_manual(values = device_colors, guide = "none", aesthetics = c("fill", "color")) +
+  labs(title = "Device A clears both thresholds, Device B misses both",
+       x = NULL, y = "Bootstrap replicates") +
+  theme_minimal()
+```
+
+Device A clears both thresholds with a wide margin, Device B misses both.
+The estimates, bounds and true values are in [appendix D](#sec-appendix-d).
+
+::: {.callout-warning}
+## Exploratory, not a calibrated test
+
+These percentile bounds have not been checked by simulation.
+Their false acceptance rate at the boundary ($\pi_J = 0.95$, or $R = 1$) is unknown, so they are not tests with a known level.
+In the Monte Carlo document, the patient bootstrap intervals of the LoA covered a few points below 95% with 40 patients, so these bounds may be optimistic too.
+The thesis treats the containment bound the same way.
+:::
+
+<!-- WEB: Do not put the appendix (sections A to E below) on the project page, only the main part above.
+Instead:
+1. Upload the full rendered joint-agreement.html (self-contained, embed-resources: true) to the site next to the project page, and link it from the end of the main part as "Full analysis with appendix".
+2. Point every mention of the appendix in the main part to that full version, or reword it as "in the full analysis". There are 5, "([appendix A](#sec-appendix-a))" to "[appendix D](#sec-appendix-d)" and "All tables and technical details are in the appendix".
+3. Also link the GitHub repository with the code. It is NOT on GitHub yet (2026-11-09). When it is, ask Daniel for the link before publishing. Never guess the URL. Until then, leave the GitHub link out. -->
+
+## Appendix
+
+### A. Fitted parameters {#sec-appendix-a}
+
+```{r}
+#| label: fit-table
+quantities <- c(bias = "Bias (L/min)", sd_patient = "SD between patients", sd_residual = "SD within patient",
+                icc = "ICC", lower_loa = "Lower LoA (L/min)", upper_loa = "Upper LoA (L/min)")
+tibble(quantity = unname(quantities),
+       a_estimate = unname(unlist(fit_a[names(quantities)])),
+       a_truth = unname(unlist(attr(study_a, "truth")[names(quantities)])),
+       b_estimate = unname(unlist(fit_b[names(quantities)])),
+       b_truth = unname(unlist(attr(study_b, "truth")[names(quantities)]))) |>
+  gt() |>
+  fmt_number(columns = -quantity, decimals = 2) |>
+  tab_spanner(label = "Device A", columns = starts_with("a_")) |>
+  tab_spanner(label = "Device B", columns = starts_with("b_")) |>
+  tab_header(title = "Additive model fitted to each device", subtitle = "40 patients x 8 measurements") |>
+  cols_label(quantity = "", a_estimate = "Estimate", a_truth = "True value",
+             b_estimate = "Estimate", b_truth = "True value")
+```
+
+### B. The three regions for two measurements {#sec-appendix-b}
+
+```{r}
+#| label: regions-table
+regions |>
+  select(device, region, probability) |>
+  gt(groupname_col = "device") |>
+  fmt_percent(columns = probability, decimals = 1) |>
+  tab_header(title = "Joint probability of each region",
+             subtitle = "Two differences from the same new patient, true parameters") |>
+  cols_label(region = "", probability = "Joint probability")
+```
+
+### C. Exact binomial test {#sec-appendix-c}
+
+```{r}
+#| label: binomial-table
+binomial |>
+  gt() |>
+  fmt_number(columns = p_value, decimals = 3) |>
+  tab_header(title = "Exact binomial test", subtitle = "All 8 measurements of each patient, J = 8") |>
+  cols_label(device = "", patients = "Patients", inside = "Inside the clinical region",
+             p_value = "One-sided p-value")
+```
+
+```{r}
+#| label: fig-binomial-limit
+#| fig-cap: "Smallest possible p-value of the binomial test, reached when every patient is inside the clinical region. Dashed: α = 0.05. Dotted: 59 patients."
+#| fig-width: 7
+#| fig-height: 3.5
+tibble(patients = 1:100, min_p = 0.95^patients) |>
+  ggplot(aes(patients, min_p)) +
+  geom_line() +
+  geom_hline(yintercept = 0.05, linetype = "dashed") +
+  geom_vline(xintercept = 59, linetype = "dotted") +
+  annotate("point", x = nrow(d_a), y = 0.95^nrow(d_a), size = 2.5) +
+  annotate("text", x = nrow(d_a), y = 0.95^nrow(d_a), label = "This study", hjust = -0.2, vjust = -0.6) +
+  labs(title = "The binomial test needs at least 59 patients with the same J",
+       x = "Patients with the same number of measurements", y = "Smallest possible p-value") +
+  theme_minimal()
+```
+
+### D. Model-based criteria in full {#sec-appendix-d}
+
+```{r}
+#| label: criteria-table
+decisions |>
+  mutate(across(ends_with("_shown"), \(shown) if_else(shown, "Shown", "Not shown"))) |>
+  select(device, coverage, coverage_lower, coverage_true, coverage_shown,
+         containment, containment_upper, containment_true, containment_shown) |>
+  gt() |>
+  fmt_number(columns = c(coverage, coverage_lower, coverage_true), decimals = 3) |>
+  fmt_number(columns = c(containment, containment_upper, containment_true), decimals = 2) |>
+  tab_spanner(label = "Clinical coverage (primary)", columns = starts_with("coverage")) |>
+  tab_spanner(label = "Containment ratio (secondary)", columns = starts_with("containment")) |>
+  tab_header(title = "Model-based criteria with one-sided 95% bootstrap bounds",
+             subtitle = "J = 8 measurements per patient") |>
+  cols_label(device = "",
+             coverage = "Estimate", coverage_lower = "Lower bound", coverage_true = "True value",
+             coverage_shown = "Acceptable agreement",
+             containment = "Estimate", containment_upper = "Upper bound", containment_true = "True value",
+             containment_shown = "Acceptable agreement")
+```
+
+The estimates come from the additive model fitted with `fit_agreement()`, the bounds from the 2,000 bootstrap refits, and the true values from the parameters used to simulate the data.
+
+### E. Checks {#sec-appendix-e}
+
+The formulas in `R/joint_agreement.R` against brute force.
+$\pi_J$ is compared with 100,000 simulated new patients, and $R(J)$ with a numerical maximum over the boundary of $E_J$ (`optim()` from 20 random directions).
+
+```{r}
+#| label: checks
+#| cache: true
+#| cache.extra: !expr list(truth, clinical, tools::md5sum("../R/joint_agreement.R"))
+set.seed(7)
+
+# Share of n simulated new patients whose J differences are inside the clinical region
+simulated_coverage <- function(J, bias, sd_patient, sd_residual, n = 1e5) {
+  # Row i holds bias + u_i + e_ij: the vector of u_i is recycled down each column
+  d <- bias + rnorm(n, 0, sd_patient) + matrix(rnorm(n * J, 0, sd_residual), nrow = n)
+  mean(inside_clinical(d, clinical))
+}
+
+# Largest clinical distance over the boundary of the device ellipsoid E_J, by numerical maximization
+numerical_containment <- function(J, bias, sd_patient, sd_residual, starts = 20) {
+  cutoff <- qchisq(0.95, df = J)
+  root <- t(chol(joint_covariance(J, sd_patient, sd_residual)))  # root %*% t(root) = Sigma_J
+  clinical_cov <- joint_covariance(J, clinical$sd_patient, clinical$sd_residual)
+
+  # The boundary point of E_J in direction x
+  distance <- function(x) {
+    d <- bias + sqrt(cutoff) * root %*% (x / sqrt(sum(x^2)))
+    mahalanobis(t(d), center = rep(clinical$bias, J), cov = clinical_cov) / cutoff
+  }
+  if (J == 1) return(max(distance(1), distance(-1)))  # for J = 1 the boundary is two points
+  max(map_dbl(1:starts, \(s) optim(rnorm(J), distance, method = "BFGS",
+                                   control = list(fnscale = -1))$value))  # fnscale = -1: maximize
+}
+
+checks <- expand_grid(select(truth, device, bias, sd_patient, sd_residual), J = c(1, 2, 8)) |>
+  mutate(coverage = pmap_dbl(pick(J, bias, sd_patient, sd_residual), clinical_coverage, clinical = clinical),
+         coverage_simulated = pmap_dbl(pick(J, bias, sd_patient, sd_residual), simulated_coverage),
+         containment = pmap_dbl(pick(J, bias, sd_patient, sd_residual), containment_ratio, clinical = clinical),
+         containment_numerical = pmap_dbl(pick(J, bias, sd_patient, sd_residual), numerical_containment))
+
+checks |>
+  select(device, J, coverage, coverage_simulated, containment, containment_numerical) |>
+  gt(groupname_col = "device") |>
+  fmt_number(columns = starts_with("coverage"), decimals = 4) |>
+  fmt_number(columns = starts_with("containment"), decimals = 4) |>
+  tab_spanner(label = "Clinical coverage", columns = starts_with("coverage")) |>
+  tab_spanner(label = "Containment ratio", columns = starts_with("containment")) |>
+  tab_header(title = "Formulas vs brute force", subtitle = "True parameters of each device") |>
+  tab_source_note("Monte Carlo SE of the simulated coverage: at most 0.0007.") |>
+  cols_label(J = "J", coverage = "Formula", coverage_simulated = "Simulated",
+             containment = "Closed form", containment_numerical = "Numerical maximum")
+```

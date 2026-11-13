@@ -1,0 +1,661 @@
+---
+title: "Agreement analysis of cardiac output measurements"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+execute:
+  warning: false
+bibliography: references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(lme4)  # linear mixed models with lmer(), not part of the tidyverse
+library(gt)    # nicely formatted tables, not part of the tidyverse
+
+source("../R/simulate_study.R")
+source("../R/fit_agreement.R")
+source("../R/bootstrap_loa.R")
+
+# One point shape per simulated sample, used in every plot of the study data
+dataset_shapes <- c(additive = 4, multiplicative = 1, independent = 2)  # x, circle, triangle
+```
+
+## Historical context
+
+How to compare two methods that measure the same quantity has changed a lot since the 1980s.
+Each step below fixed a problem of the previous approach, and each one is part of the analysis in this document.
+
+### 1. Previous methods (1983)
+
+#### Correlation is not agreement
+
+Before Bland and Altman, two methods were usually compared with a correlation coefficient or a linear regression.
+@altman1983 pointed out that correlation measures association, not agreement.
+If one device always reports twice the reference value, then $\operatorname{Cor}(X, 2X) = 1$, but the two methods are clearly not interchangeable.
+
+The example below compares two simulated devices against the same reference.
+Device A has the higher correlation, but it is useless. Device B has a lower correlation, but its values are close to the reference.
+
+```{r}
+#| label: correlation-data
+set.seed(1983)
+reference <- rnorm(100, mean = 5, sd = 1)
+
+devices <- bind_rows(
+  tibble(device = "Device A: Y = 2X", reference = reference, test = 2 * reference),
+  tibble(device = "Device B: Y = X + noise", reference = reference,
+         test = reference + rnorm(100, mean = 0, sd = 0.4))
+) |>
+  mutate(difference = test - reference,
+         mean = (test + reference) / 2) |>
+  # Correlation of each device with the reference, shown in the panel title
+  group_by(device) |>
+  mutate(device_label = paste0(device, "  (r = ", round(cor(reference, test), 2), ")")) |>
+  ungroup()
+```
+
+```{r}
+#| label: fig-correlation
+#| fig-cap: "Correlation. The dashed line is perfect agreement, Y = X. Device A lies on a perfect straight line, but far from the dashed line."
+#| fig-width: 8
+#| fig-height: 4
+ggplot(devices, aes(reference, test)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~ device_label) +
+  labs(x = "Reference X (L/min)", y = "Device Y (L/min)") +
+  theme_minimal()
+```
+
+#### Linear regression is not agreement
+
+Linear regression has a less obvious problem.
+Suppose both methods measure the same true value $T$ with their own error,
+
+$$
+X = T + \varepsilon_X, \qquad Y = T + \varepsilon_Y,
+$$
+
+where the errors have mean zero and are independent of each other and of $T$.
+
+The least squares slope of $Y$ on $X$ is often reported as an indicator of agreement.
+
+$$
+Y = \beta_0 + \beta_1 X + e
+$$
+
+Therefore,
+
+$$
+\widehat\beta_1 = \frac{\widehat{\operatorname{Cov}}(X, Y)}{\widehat{\operatorname{Var}}(X)}
+\;\xrightarrow{p}\;
+\frac{\operatorname{Var}(T)}{\operatorname{Var}(T) + \operatorname{Var}(\varepsilon_X)} < 1
+$$
+
+- The slope is below 1 even when the two methods are equally good.
+- Just by increasing $\operatorname{Var}(\varepsilon_X)$, the slope $\beta_1$ goes to zero, even if neither method is biased.
+
+<!-- WEB: Interactive version of this plot. A slider changes Var(ε_X) from 0 to Var(D),
+with Var(ε_Y) = Var(D) - Var(ε_X), so Var(D), the bias and the LoA stay fixed.
+Show the scatter with the Y = X line and the fitted line, plus the fitted slope and the
+theoretical slope Var(T) / (Var(T) + Var(ε_X)) as text that updates.
+Keep the true values T fixed across the slider. -->
+
+```{r}
+#| label: fig-slope
+#| fig-cap: "Dashed line: Y = X. Solid line: least squares fit."
+#| fig-width: 9
+#| fig-height: 4
+
+set.seed(2007)
+n <- 500
+var_t <- 0.25
+var_d <- 0.5
+true_co <- rnorm(n, mean = 5, sd = sqrt(var_t))
+
+# The reference gets var_error_x, the device gets the rest of var_d
+simulate_errors <- function(var_error_x) {
+  tibble(
+    var_error_x = var_error_x,
+    reference = true_co + rnorm(n, mean = 0, sd = sqrt(var_error_x)),
+    test      = true_co + rnorm(n, mean = 0, sd = sqrt(var_d - var_error_x))
+  )
+}
+
+slope_data <- map(c(0, 0.25, 0.5), simulate_errors) |>
+  list_rbind() |>
+  mutate(difference = test - reference,
+         scenario = case_when(
+           var_error_x == 0    ~ "Error only in the device",
+           var_error_x == 0.25 ~ "Error split equally",
+           var_error_x == 0.5  ~ "Error only in the reference\n(the device is perfect)"
+         ),
+         scenario = fct_inorder(scenario))  # keep this panel order, not alphabetical
+
+ggplot(slope_data, aes(reference, test)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  facet_wrap(~ scenario) +
+  coord_equal() +
+  labs(title = "Same agreement, different slopes",
+       subtitle = "All panels have the same bias and limits of agreement. Only the method with the error changes.",
+       x = "Reference X (L/min)", y = "Device Y (L/min)") +
+  theme_minimal()
+```
+
+### 2. Bland–Altman plot (1986)
+
+Bland and Altman's solution was to look directly at the differences $D = Y - X$, plotted against the mean $(X + Y)/2$ [@bland1986] and plot the bias $\bar D$ and the limits of agreement $\bar D \pm 1.96\, s_D$.
+This Bland–Altman plot shows at once what the correlation hides: Device A is off by about 3 to 7 L/min.
+
+```{r}
+#| label: fig-bland-altman-devices
+#| fig-cap: "Bland–Altman plot of the same two devices. The dashed line is zero difference."
+#| fig-width: 8
+#| fig-height: 4
+ggplot(devices, aes(mean, difference)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~ device_label) +
+  labs(x = "Mean of X and Y (L/min)", y = "Difference Y - X (L/min)") +
+  theme_minimal()
+```
+
+### 3. Log transformation for proportional error (1986, 1999, 2008, 2025)
+
+The limits $\bar D \pm 1.96\, s_D$ assume that the spread of the differences is the same for small and large values.
+In cardiac output this is often false: the error grows with the magnitude of CO.
+Bland and Altman suggested analyzing $\log Y - \log X = \log(Y/X)$ instead [@bland1986; @bland1999].
+On the log scale the spread is often constant, and after exponentiating, the limits of agreement are limits for the ratio $Y/X$.
+@euser2008 and @parner2025 showed how to draw these ratio limits back on the original Bland–Altman plot, where they become lines that widen with the mean.
+This is the multiplicative model below.
+
+### 4. Repeated measurements (1999, 2007)
+
+The classical limits assume independent differences.
+In practice each patient contributes several measurements, and measurements from the same patient are correlated.
+@bland1999 and @bland2007 extended the method to multiple observations per individual by splitting the variance into a between-patient and a within-patient part.
+Later work wrote this as a linear mixed model [@parker2016].
+Here the random-intercept model $D_{ij} = \beta_0 + u_i + \varepsilon_{ij}$ is used, and the limits of agreement use the total standard deviation $\sqrt{\sigma_u^2 + \sigma_\varepsilon^2}$.
+
+### 5. Limits of agreement are estimates (1986 to today)
+
+The limits of agreement are computed from a sample, so they are uncertain too.
+@bland1986 already gave an approximate standard error for them, and many methods followed, for example @zou2013 for repeated measurements.
+Here a nonparametric patient-cluster bootstrap is used: whole patients are resampled with replacement, the model is refitted, and percentile intervals are taken.
+Resampling patients, not single measurements, keeps the within-patient dependence. The method also works for unequal numbers of measurements per patient and for the exponentiated limits of the multiplicative model.
+
+## Data
+
+40 patients with 8 paired measurements each.
+60% of the variance of the disagreement comes from the patient (ICC = 0.6).
+
+
+::: {.callout-note}
+
+In all later plots,
+
+- × marks the additive data, 
+- ○ the multiplicative data and 
+- △ data without a patient effect.
+
+:::
+
+
+```{r}
+#| label: simulate
+icc <- 0.6
+
+# Total variance of D from the simulate_study() defaults, split by the ICC
+var_add <- 0.50^2 + 0.70^2      # additive, in (L/min)^2
+var_mult <- 0.087^2 + 0.123^2   # multiplicative, on the log scale
+
+study_add <- simulate_study(scale = "additive",
+                            sd_patient = sqrt(icc * var_add),
+                            sd_residual = sqrt((1 - icc) * var_add),
+                            seed = 1)
+study_mult <- simulate_study(scale = "multiplicative",
+                             sd_patient = sqrt(icc * var_mult),
+                             sd_residual = sqrt((1 - icc) * var_mult),
+                             seed = 1)
+
+head(study_mult) |>
+  gt() |>
+  fmt_number(columns = where(is.double), decimals = 2)
+```
+
+The data are simulated, so the true bias and limits of agreement are known and every estimate can be checked against them.
+The reference cardiac output ranges from `r sprintf("%.1f", min(study_mult$reference))` to `r sprintf("%.1f", max(study_mult$reference))` L/min, with a median of `r sprintf("%.1f", median(study_mult$reference))` L/min.
+
+## Classical analysis
+
+This is the analysis most cardiac output studies report.
+It treats all 320 differences as independent, as in @bland1986.
+
+```{r}
+#| label: classical
+classical_mult <- study_mult |>
+  summarize(
+    bias = mean(difference),
+    sd_d = sd(difference),
+    lower_loa = bias - 1.96 * sd_d,
+    upper_loa = bias + 1.96 * sd_d,
+    mean_co = mean(mean),
+    pe = 100 * 1.96 * sd_d / mean_co,
+    # Approximate 95% CIs from Bland and Altman (1986), assuming independence
+    n = n(),
+    t = qt(0.975, df = n - 1),
+    se_bias = sd_d / sqrt(n),
+    se_loa = sqrt(3 * sd_d^2 / n)
+  )
+```
+
+```{r}
+#| label: fig-classical-bland-altman
+#| fig-cap: "Solid line: bias. Dashed lines: 95% limits of agreement."
+#| fig-width: 7
+#| fig-height: 4.5
+ggplot(study_mult, aes(mean, difference)) +
+  geom_point(alpha = 0.5, shape = dataset_shapes["multiplicative"]) +
+  geom_hline(yintercept = classical_mult$bias) +
+  geom_hline(yintercept = c(classical_mult$lower_loa, classical_mult$upper_loa), linetype = "dashed") +
+  annotate("text", x = max(study_mult$mean),
+           y = c(classical_mult$bias, classical_mult$lower_loa, classical_mult$upper_loa),
+           label = c("Bias", "Lower LoA", "Upper LoA"),
+           hjust = 1, vjust = -0.5) +
+  labs(title = "Classical Bland–Altman plot",
+       x = "Mean of X and Y (L/min)", y = "Difference Y - X (L/min)") +
+  theme_minimal()
+```
+
+@bland1986 also gave approximate 95% confidence intervals: $\bar D \pm t_{n-1}\, s_D / \sqrt{n}$ for the bias and $\text{LoA} \pm t_{n-1} \sqrt{3 s_D^2 / n}$ for each limit.
+Both assume independent differences, so with several measurements per patient they are too narrow.
+
+The percentage error expresses the width of the limits relative to the mean cardiac output $\bar m$ [@critchley1999],
+
+$$
+\text{PE} = \frac{1.96\, s_D}{\bar m} \times 100\%.
+$$
+
+The usual threshold is 30%: if the reference and the device each have a precision of about 20%, the combined error is $\sqrt{20^2 + 20^2} \approx 28\%$, which is rounded to 30%.
+The threshold depends on this assumed precision of the reference, so it is not a universal criterion.
+
+```{r}
+#| label: classical-table
+ci_text <- function(estimate, se, t) {
+  sprintf("[%.2f, %.2f]", estimate - t * se, estimate + t * se)
+}
+
+tibble(
+  quantity = c("Bias (L/min)", "Lower LoA (L/min)", "Upper LoA (L/min)", "Percentage error"),
+  estimate = c(sprintf("%.2f", classical_mult$bias),
+               sprintf("%.2f", classical_mult$lower_loa),
+               sprintf("%.2f", classical_mult$upper_loa),
+               sprintf("%.1f%%", classical_mult$pe)),
+  ci = c(ci_text(classical_mult$bias, classical_mult$se_bias, classical_mult$t),
+         ci_text(classical_mult$lower_loa, classical_mult$se_loa, classical_mult$t),
+         ci_text(classical_mult$upper_loa, classical_mult$se_loa, classical_mult$t),
+         NA)
+) |>
+  gt() |>
+  tab_header(title = "Classical Bland–Altman analysis",
+             subtitle = "All 320 measurements treated as independent") |>
+  sub_missing(missing_text = "") |>
+  cols_label(quantity = "", estimate = "Estimate", ci = "95% CI")
+```
+
+## Diagnostics: are the classical assumptions met?
+
+The classical limits assume that the differences are independent and that their spread does not depend on the size of CO.
+
+### Independence
+
+To see what independence looks like, the study is compared with a simulated study without a patient effect ($\sigma_u = 0$) and the same total variance.
+
+```{r}
+#| label: fig-patient-clusters
+#| fig-cap: "Each column is one patient, ordered by its median difference. The line is the overall bias."
+#| fig-width: 9
+#| fig-height: 6
+study_indep <- simulate_study(scale = "multiplicative", sd_patient = 0,
+                              sd_residual = sqrt(var_mult), seed = 1)
+
+cluster_data <- bind_rows(
+  study_indep |> mutate(dataset = "No patient effect (independent)", sample = "independent"),
+  study_mult  |> mutate(dataset = "Patient effect (this study)", sample = "multiplicative")
+) |>
+  # Unique patient ids per dataset, ordered by their median difference
+  mutate(patient = fct_reorder(paste(dataset, patient), difference))
+
+ggplot(cluster_data, aes(patient, difference)) +
+  geom_point(aes(shape = sample), alpha = 0.5) +
+  scale_shape_manual(values = dataset_shapes, guide = "none") +
+  geom_hline(data = summarize(cluster_data, bias = mean(difference), .by = dataset),
+             aes(yintercept = bias)) +
+  facet_wrap(~ dataset, ncol = 1, scales = "free_x") +
+  labs(title = "With a patient effect, measurements from the same patient cluster together",
+       x = "Patient", y = "Difference Y - X (L/min)") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), panel.grid.major.x = element_blank())
+```
+
+The intraclass correlation $\text{ICC} = \frac{\sigma_u^2}{\sigma_u^2 + \sigma_\varepsilon^2}$ is the share of the variance of $D$ that comes from the patient.
+
+```{r}
+#| label: icc-table
+#| message: false
+tibble(
+  dataset = c("No patient effect (independent)", "Patient effect (this study)"),
+  icc = c(fit_agreement(study_indep, response = "difference")$icc,
+          fit_agreement(study_mult, response = "difference")$icc)
+) |>
+  gt() |>
+  fmt_number(columns = icc, decimals = 2) |>
+  cols_label(dataset = "", icc = "ICC")
+```
+
+The estimate for this study is below the simulated ICC of 0.6 for two reasons.
+The 0.6 was set on the log scale, while this table uses the raw differences $Y - X$. And an ICC estimated from only 40 patients is noisy.
+
+### Constant spread
+
+The additive and the multiplicative study are shown on both scales.
+
+```{r}
+#| label: fig-spread
+#| fig-cap: "Rows: how the data were simulated. Columns: the scale of the analysis. The dashed line is the mean of each panel."
+#| fig-width: 9
+#| fig-height: 7
+spread_data <- bind_rows(
+  study_add  |> mutate(dataset = "Additive data", sample = "additive"),
+  study_mult |> mutate(dataset = "Multiplicative data", sample = "multiplicative")
+) |>
+  select(dataset, sample, mean, difference, log_ratio) |>
+  pivot_longer(c(difference, log_ratio), names_to = "scale", values_to = "value") |>
+  mutate(scale = if_else(scale == "difference", "Raw scale: Y - X (L/min)", "Log scale: log(Y / X)"),
+         scale = factor(scale, levels = c("Raw scale: Y - X (L/min)", "Log scale: log(Y / X)"))) |>
+  group_by(dataset, scale) |>
+  mutate(abs_residual = abs(value - mean(value))) |>
+  ungroup()
+
+ggplot(spread_data, aes(mean, value)) +
+  geom_point(aes(shape = sample), alpha = 0.4) +
+  scale_shape_manual(values = dataset_shapes, guide = "none") +
+  geom_hline(data = summarize(spread_data, value = mean(value), .by = c(dataset, scale)),
+             aes(yintercept = value), linetype = "dashed") +
+  facet_wrap(~ dataset + scale, ncol = 2, scales = "free_y") +
+  labs(title = "The right scale is the one where the spread is constant",
+       subtitle = "Additive data: raw scale. Multiplicative data: log scale.",
+       x = "Mean of X and Y (L/min)", y = NULL) +
+  theme_minimal()
+```
+
+To put a number on it, the table shows the Spearman correlation between the absolute residual $|D_{ij} - \bar D|$ and the mean [@bland1999].
+Close to 0 means constant spread. It is only descriptive: a p-value would again assume independent measurements.
+
+```{r}
+#| label: spread-table
+spread_data |>
+  summarize(rho = cor(abs_residual, mean, method = "spearman"), .by = c(dataset, scale)) |>
+  pivot_wider(names_from = scale, values_from = rho) |>
+  gt() |>
+  fmt_number(columns = -dataset, decimals = 2) |>
+  tab_header(title = "Spearman correlation of |residual| with the mean") |>
+  cols_label(dataset = "")
+```
+
+### Conclusion
+
+Both classical assumptions fail, and each failure points to one part of the analysis:
+
+- **Measurements are not independent.** Patients form clusters, so the disagreement is modeled with a random patient effect, and the confidence intervals are computed by resampling whole patients.
+- **The scale must match the error.** The spread is constant on the raw scale for the additive data and on the log scale for the multiplicative data. So the additive data are analyzed with the additive model, and the multiplicative data with the multiplicative model.
+
+## Agreement models
+
+The analyses in this document differ in two independent choices, which are exactly the two assumptions checked in the Diagnostics:
+
+| | Ignores the patient | Patient effect (random intercept) |
+|---|---|---|
+| **Raw scale**, $D = Y - X$ | **Classical** [@bland1986] | **Additive model** [@bland1999; @bland2007; @parker2016] |
+| **Log scale**, $D = \log(Y/X)$ | Classical on the log scale [@bland1986; @bland1999], not used here | **Multiplicative model**, Bland-Altman plot drawn in L/min as in @euser2008 and @parner2025 |
+
+Both models are random-intercept models for the disagreement of patient $i$ at measurement $j$,
+
+$$
+D_{ij} = \beta_0 + u_i + \varepsilon_{ij},\quad u_i \sim N(0,\sigma_u^2),\quad \varepsilon_{ij} \sim N(0,\sigma_\varepsilon^2),
+\qquad
+\text{LoA} = \beta_0 \pm 1.96\sqrt{\sigma_u^2 + \sigma_\varepsilon^2}.
+$$
+
+The additive model uses $D_{ij} = Y_{ij} - X_{ij}$. The multiplicative model uses $D_{ij} = \log(Y_{ij}/X_{ij})$, and its limits are exponentiated to get limits for the ratio $Y/X$.
+Both are fitted by REML.
+
+The confidence interval of the bias is a Wald interval, $\hat\beta_0 \pm t_{0.975,\,I-1}\,\widehat{SE}$, with $I - 1 = 39$ degrees of freedom because the bias is estimated from 40 independent patients, not from 320 independent measurements.
+The confidence intervals of the limits of agreement use a patient bootstrap: the 40 patients are resampled with replacement, keeping all measurements of each selected patient, and the model is refitted 2,000 times.
+The 95% CI is given by the 2.5% and 97.5% percentiles of the refitted limits.
+
+### Additive model
+
+```{r}
+#| label: bootstrap-additive
+#| cache: true
+#| cache.extra: !expr list(study_add, tools::md5sum(c("../R/fit_agreement.R", "../R/bootstrap_loa.R")))
+#| message: false
+# Slow (2,000 refits), so the result is cached.
+# The cache is rerun when this code, the data or the R functions change.
+boot_add <- bootstrap_loa(study_add, response = "difference")
+```
+
+```{r}
+#| label: fit-additive
+fit_add <- fit_agreement(study_add, response = "difference")
+truth_add <- attr(study_add, "truth")
+
+# Estimates next to the true values used to simulate the data
+tibble(
+  quantity = c("Bias (L/min)", "SD between patients", "SD within patient",
+               "Lower LoA (L/min)", "Upper LoA (L/min)"),
+  estimate = c(fit_add$bias, fit_add$sd_patient, fit_add$sd_residual, fit_add$lower_loa, fit_add$upper_loa),
+  ci = c(sprintf("[%.2f, %.2f]", fit_add$bias_lower, fit_add$bias_upper), NA, NA,
+         percentile_ci(boot_add$lower_loa), percentile_ci(boot_add$upper_loa)),
+  truth = c(truth_add$bias, truth_add$sd_patient, truth_add$sd_residual,
+            truth_add$lower_loa, truth_add$upper_loa)
+) |>
+  gt() |>
+  tab_header(title = "Additive model on the additive data") |>
+  fmt_number(columns = c(estimate, truth), decimals = 2) |>
+  sub_missing(missing_text = "") |>
+  cols_label(quantity = "", estimate = "Estimate", ci = "95% CI", truth = "True value")
+```
+
+```{r}
+#| label: fig-additive
+#| fig-cap: "Solid line: bias. Dashed lines: limits of agreement. Shaded: 95% CIs (Wald for the bias, bootstrap for the limits)."
+#| fig-width: 7
+#| fig-height: 4.5
+ci_lower_add <- quantile(boot_add$lower_loa, c(0.025, 0.975))
+ci_upper_add <- quantile(boot_add$upper_loa, c(0.025, 0.975))
+
+ggplot(study_add, aes(mean, difference)) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = ci_lower_add[1], ymax = ci_lower_add[2], alpha = 0.2) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = ci_upper_add[1], ymax = ci_upper_add[2], alpha = 0.2) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = fit_add$bias_lower, ymax = fit_add$bias_upper, alpha = 0.2) +
+  geom_point(alpha = 0.4, shape = dataset_shapes["additive"]) +
+  geom_hline(yintercept = fit_add$bias) +
+  geom_hline(yintercept = c(fit_add$lower_loa, fit_add$upper_loa), linetype = "dashed") +
+  labs(title = "Additive model: the limits are the same at every level of CO",
+       x = "Mean of X and Y (L/min)", y = "Difference Y - X (L/min)") +
+  theme_minimal()
+```
+
+About 95% of the differences between device and reference are expected to lie between `r sprintf("%.2f", fit_add$lower_loa)` and `r sprintf("%.2f", fit_add$upper_loa)` L/min, whatever the cardiac output.
+
+### Multiplicative model
+
+```{r}
+#| label: bootstrap-multiplicative
+#| cache: true
+#| cache.extra: !expr list(study_mult, tools::md5sum(c("../R/fit_agreement.R", "../R/bootstrap_loa.R")))
+#| message: false
+# Limits on the log scale. Percentiles commute with exp(), so exponentiating
+# each refit or the final percentiles gives the same ratio CI.
+boot_mult <- bootstrap_loa(study_mult, response = "log_ratio")
+```
+
+```{r}
+#| label: fit-multiplicative
+fit_mult <- fit_agreement(study_mult, response = "log_ratio")
+truth_mult <- attr(study_mult, "truth")
+
+# Bias and LoA on the ratio scale Y / X, SDs on the log scale
+tibble(
+  quantity = c("Ratio bias (Y/X)", "SD between patients (log)", "SD within patient (log)",
+               "Lower ratio LoA", "Upper ratio LoA"),
+  estimate = c(fit_mult$ratio_bias, fit_mult$sd_patient, fit_mult$sd_residual,
+               fit_mult$ratio_lower_loa, fit_mult$ratio_upper_loa),
+  ci = c(sprintf("[%.3f, %.3f]", exp(fit_mult$bias_lower), exp(fit_mult$bias_upper)), NA, NA,
+         percentile_ci(exp(boot_mult$lower_loa), digits = 3),
+         percentile_ci(exp(boot_mult$upper_loa), digits = 3)),
+  truth = c(truth_mult$ratio_bias, truth_mult$sd_patient, truth_mult$sd_residual,
+            truth_mult$ratio_lower_loa, truth_mult$ratio_upper_loa)
+) |>
+  gt() |>
+  tab_header(title = "Multiplicative model on the multiplicative data") |>
+  fmt_number(columns = c(estimate, truth), decimals = 3) |>
+  sub_missing(missing_text = "") |>
+  cols_label(quantity = "", estimate = "Estimate", ci = "95% CI", truth = "True value")
+```
+
+To draw the ratio limits in L/min [@euser2008; @parner2025], note that $Y = rX$ and $m = (X + Y)/2$ give $D = Y - X = \frac{2(r - 1)}{r + 1}\, m$.
+So each ratio $r$ is a straight line through the origin.
+
+```{r}
+#| label: fig-multiplicative
+#| fig-cap: "Solid line: bias. Dashed lines: limits of agreement. Shaded: 95% CIs (Wald for the bias, bootstrap for the limits). All are ratios drawn in L/min."
+#| fig-width: 7
+#| fig-height: 4.5
+ratio_to_slope <- function(r) 2 * (r - 1) / (r + 1)
+
+ci_lower_mult <- ratio_to_slope(exp(quantile(boot_mult$lower_loa, c(0.025, 0.975))))
+ci_upper_mult <- ratio_to_slope(exp(quantile(boot_mult$upper_loa, c(0.025, 0.975))))
+ci_bias_mult <- ratio_to_slope(exp(c(fit_mult$bias_lower, fit_mult$bias_upper)))
+
+bands <- tibble(mean = seq(min(study_mult$mean), max(study_mult$mean), length.out = 100))
+
+ggplot(study_mult, aes(mean, difference)) +
+  geom_ribbon(data = bands, aes(x = mean, ymin = ci_lower_mult[1] * mean, ymax = ci_lower_mult[2] * mean),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_ribbon(data = bands, aes(x = mean, ymin = ci_upper_mult[1] * mean, ymax = ci_upper_mult[2] * mean),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_ribbon(data = bands, aes(x = mean, ymin = ci_bias_mult[1] * mean, ymax = ci_bias_mult[2] * mean),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_point(alpha = 0.4, shape = dataset_shapes["multiplicative"]) +
+  geom_abline(intercept = 0, slope = ratio_to_slope(fit_mult$ratio_bias)) +
+  geom_abline(intercept = 0, slope = ratio_to_slope(c(fit_mult$ratio_lower_loa, fit_mult$ratio_upper_loa)),
+              linetype = "dashed") +
+  labs(title = "Multiplicative model: the limits widen with CO",
+       x = "Mean of X and Y (L/min)", y = "Difference Y - X (L/min)") +
+  theme_minimal()
+```
+
+About 95% of the device's measurements are expected to lie between `r round(100 * (1 - fit_mult$ratio_lower_loa))`% below and `r round(100 * (fit_mult$ratio_upper_loa - 1))`% above the reference value.
+
+## Main figure
+
+The classical analysis and the multiplicative model on the same data.
+
+```{r}
+#| label: fig-main
+#| fig-cap: "Solid lines: bias. Dashed lines: limits of agreement. Shaded: 95% CIs of the limits (classical: Bland and Altman 1986 approximation, model: patient bootstrap)."
+#| fig-width: 8
+#| fig-height: 5
+classical_label <- "Classical (independent measurements, raw scale)"
+model_label <- "Multiplicative model (patient effect, log scale)"
+
+# Lines: horizontal for the classical analysis, through the origin for the model
+classical_lines <- tibble(
+  method = classical_label,
+  line = c("bias", "loa", "loa"),
+  y = c(classical_mult$bias, classical_mult$lower_loa, classical_mult$upper_loa)
+)
+model_lines <- tibble(
+  method = model_label,
+  line = c("bias", "loa", "loa"),
+  slope = ratio_to_slope(c(fit_mult$ratio_bias, fit_mult$ratio_lower_loa, fit_mult$ratio_upper_loa))
+)
+
+# CI bands of the limits of agreement
+classical_bands <- tibble(
+  method = classical_label,
+  ymin = c(classical_mult$lower_loa, classical_mult$upper_loa) - classical_mult$t * classical_mult$se_loa,
+  ymax = c(classical_mult$lower_loa, classical_mult$upper_loa) + classical_mult$t * classical_mult$se_loa
+)
+model_bands <- bind_rows(
+  bands |> mutate(limit = "lower", ymin = ci_lower_mult[1] * mean, ymax = ci_lower_mult[2] * mean),
+  bands |> mutate(limit = "upper", ymin = ci_upper_mult[1] * mean, ymax = ci_upper_mult[2] * mean)
+) |>
+  mutate(method = model_label)
+
+method_colors <- setNames(c("#D55E00", "#0072B2"), c(classical_label, model_label))
+
+main_figure <- ggplot(study_mult, aes(mean, difference)) +
+  geom_rect(data = classical_bands, aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax, fill = method),
+            inherit.aes = FALSE, alpha = 0.2) +
+  geom_ribbon(data = model_bands, aes(x = mean, ymin = ymin, ymax = ymax, fill = method, group = limit),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_point(alpha = 0.35, color = "grey30", shape = dataset_shapes["multiplicative"]) +
+  geom_hline(data = classical_lines, aes(yintercept = y, color = method, linetype = line)) +
+  geom_abline(data = model_lines, aes(slope = slope, intercept = 0, color = method, linetype = line)) +
+  scale_color_manual(values = method_colors, name = NULL) +
+  scale_fill_manual(values = method_colors, name = NULL) +
+  scale_linetype_manual(values = c(bias = "solid", loa = "dashed"), guide = "none") +
+  labs(title = "Classical limits vs the multiplicative model",
+       subtitle = "Constant limits are too wide at low CO and too narrow at high CO",
+       x = "Mean of X and Y (L/min)", y = "Difference Y - X (L/min)") +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+
+# Also saved for the README
+ggsave("../figures/main-figure.png", main_figure, width = 8, height = 5, dpi = 150, bg = "white")
+main_figure
+```
+
+## Summary
+
+The classical limits are one number for every patient, while the multiplicative limits scale with cardiac output.
+The table compares both with the true limits at a low, a typical and a high cardiac output.
+
+```{r}
+#| label: summary-table
+co_levels <- c(3, 5, 8)
+model_slopes <- ratio_to_slope(c(fit_mult$ratio_lower_loa, fit_mult$ratio_upper_loa))
+true_slopes <- ratio_to_slope(c(truth_mult$ratio_lower_loa, truth_mult$ratio_upper_loa))
+
+limits_text <- function(lower, upper) sprintf("%.2f to %.2f", lower, upper)
+
+tibble(co = co_levels) |>
+  mutate(
+    classical = limits_text(classical_mult$lower_loa, classical_mult$upper_loa),
+    model = limits_text(model_slopes[1] * co, model_slopes[2] * co),
+    truth = limits_text(true_slopes[1] * co, true_slopes[2] * co)
+  ) |>
+  gt() |>
+  tab_header(title = "95% limits of agreement in L/min",
+             subtitle = "At low, typical and high cardiac output") |>
+  cols_label(co = "Mean CO (L/min)", classical = "Classical",
+             model = "Multiplicative model", truth = "True value")
+```
+
+- **The classical analysis gets the shape wrong.** Its limits are too wide at low cardiac output and too narrow at high cardiac output.
+- **The classical confidence intervals are too narrow.** They treat 320 measurements as independent, but they come from only 40 patients.
+- **The multiplicative model with a patient bootstrap is close to the true limits.** About 95% of the device's measurements lie between `r round(100 * (1 - fit_mult$ratio_lower_loa))`% below and `r round(100 * (fit_mult$ratio_upper_loa - 1))`% above the reference.
+
+Whether this agreement is clinically acceptable depends on a threshold that must be fixed before the study.
+For example, with a ±30% criterion the device `r if (fit_mult$ratio_lower_loa >= 0.7 && fit_mult$ratio_upper_loa <= 1.3) "would be" else "would not be"` acceptable.
